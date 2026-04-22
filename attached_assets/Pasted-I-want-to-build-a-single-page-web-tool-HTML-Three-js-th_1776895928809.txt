@@ -1,0 +1,170 @@
+I want to build a single-page web tool (HTML + Three.js) that loads a GLB warehouse model and lets me create a fully interactive camera routing system tied to warehouse shelf IDs.
+
+The goal is to be able to type a shelf name and have the camera automatically travel through a prebuilt smooth path inside the warehouse and end at that shelf. Once it arrives, it transitions into a 360° photo inspection mode for that exact shelf location.
+
+Everything must be built inside the browser with an admin mode that allows me to create and edit all paths and 360 views without external editing tools like Blender after setup.
+
+CORE CONCEPT
+
+The system has two main modes:
+
+1. Admin Mode (editing system)
+
+This is where I build everything:
+
+Define shelf IDs (example: A12, B03, etc.)
+Build camera paths using waypoint placement in the 3D scene
+Set final camera look-at target for each shelf
+Assign a 360° panoramic image to each shelf
+Place a marker dot on that panorama showing the exact shelf location
+Define camera rotation preset for the panorama view
+Save everything into a structured config file stored locally or on a server
+2. Runtime Mode (viewer system)
+
+This is the end-user mode:
+
+User types a shelf ID
+System looks up stored path data
+Camera smoothly travels through pre-defined spline path in the GLB warehouse
+Camera arrives at shelf location
+System automatically switches from 3D GLB view into a 360° panorama viewer
+Panorama loads the assigned image and applies saved rotation preset
+Marker dot is visible indicating the shelf location inside the panorama
+3D WAREHOUSE NAVIGATION SYSTEM
+
+The warehouse is loaded as a GLB file (created in Blender).
+
+Camera movement system:
+
+Uses free-fly controls in admin mode (WASD + mouse look)
+Waypoints are manually placed by clicking “Add Waypoint”
+Each waypoint stores exact camera position (x, y, z)
+Waypoints are connected using a smooth Catmull-Rom spline curve
+Camera playback follows the spline smoothly (no linear stepping)
+At the final waypoint, camera transitions into a “focus state” using a stored lookAt position
+
+Each shelf stores:
+
+Array of waypoint positions
+Final lookAt coordinate for shelf focus
+Optional timing / easing parameters (default smooth ease-in-out)
+360° PANORAMA SYSTEM (IMPORTANT ADDITION)
+
+Each shelf also has a second layer: a 360° photo inspection view.
+
+This is NOT part of the GLB scene. It is a separate viewer mode inside the same application.
+
+When arriving at a shelf:
+
+The GLB scene is hidden or disabled
+A 360° image viewer is activated
+
+Implementation:
+a 360 viewer will be used
+User can rotate view OR the system can apply a preset rotation automatically
+
+Each shelf stores:
+
+360 image file path
+preset yaw (horizontal rotation)
+preset pitch (vertical rotation)
+PANORAMA MARKER SYSTEM (CRITICAL FEATURE)
+
+Inside admin mode, there is a tool for placing a marker dot on the 360 image.
+
+This marker represents the exact shelf location inside the panorama view.
+
+Requirements:
+
+When panorama editor is open, I can click anywhere on the screen
+A visible dot appears on the panorama at that location
+That dot is saved into config as:
+This allows me to visually mark where the shelf is in the 360 environment.
+also there should be an upload button for uploading the 360 photo that will be saved on the hosting server
+ADMIN MODE WORKFLOW
+
+Admin mode has two sub-tools:
+
+TOOL 1: 3D PATH BUILDER
+
+Workflow:
+Set/change default home position.
+Enter shelf ID (example: A12) + a barcode that will also correspond to it
+Click “Start Path Editing”
+Move freely inside GLB using fly controls (WASD only x and y axis. no z movement)(mouse camera rotation) (q & e for z axis) (scroll for fov)
+Press “Add Waypoint” at desired positions
+Repeat until full route is built
+Press “Set LookAt Target” at final shelf location
+Save path to shelf config
+
+This creates:
+
+spline path
+camera travel route
+final focus point
+TOOL 2: 360 PANORAMA EDITOR
+
+Workflow:
+
+Select same shelf ID
+Upload or enter an existing 360 equirectangular image file path on the server
+Enter panorama editing mode
+Image is shown on 360 viewer
+I can rotate view freely
+Press “Set Rotation Preset” to save camera orientation (yaw/pitch/zoom)
+Click anywhere to place a red dot marker on the panorama
+Save panorama data to shelf config
+
+This creates:
+
+panorama image link
+rotation preset
+marker position
+CAMERA STATE SYSTEM
+
+The application has three states:
+
+1. Admin Free Mode
+Full WASD + mouse camera control + other features of your choice
+Used for building waypoint paths
+2. Playback Mode (3D traversal)
+Camera follows spline path with Controls disabled Smooth motion only
+3. Panorama Mode
+GLB is hidden
+360 viewer is active
+Camera locked at center
+User can rotate view or apply saved rotation preset
+CONFIG STORAGE SYSTEM
+
+All data is stored in a single structured JSON file (can be downloaded or hosted on server).
+
+Example structure:
+
+shelf ID
+3D path waypoints
+lookAt target
+panorama image
+panorama rotation preset
+marker UV coordinates
+
+The system must support:
+
+saving config to file (download)
+loading config from file
+optionally POSTing to a local server endpoint for persistent storage
+FINAL BEHAVIOR FLOW (USER EXPERIENCE)
+User opens tool
+Types shelf ID (e.g. A12)
+Camera animates through warehouse using spline path
+Camera arrives at shelf position
+System automatically transitions into 360 panorama mode
+Panorama loads rotated to preset orientation
+Marker dot shows exact shelf location
+User can inspect environment in 360 view
+User can exit back to home warehouse view anytime (camera follows waypoints in reverse back to home point)
+IMPORTANT DESIGN NOTES
+Everything must be built in-browser (no Blender dependency after initial GLB creation)
+Waypoints must be editable and not baked into animation
+Panorama system must be modular and independent from GLB scene
+Config system must be human-readable JSON
+Admin mode must allow full creation of new shelves from scratch

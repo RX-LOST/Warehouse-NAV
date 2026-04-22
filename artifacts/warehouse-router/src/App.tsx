@@ -1,0 +1,1535 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+
+type Vec3 = { x: number; y: number; z: number };
+
+type Shelf = {
+  id: string;
+  barcode: string;
+  waypoints: Vec3[];
+  lookAt: Vec3 | null;
+  panoramaUrl: string | null;
+  panoramaYaw: number;
+  panoramaPitch: number;
+  panoramaFov: number;
+  markerYaw: number | null;
+  markerPitch: number | null;
+};
+
+type Config = {
+  glbUrl: string | null;
+  homePosition: Vec3;
+  homeLookAt: Vec3;
+  shelves: Record<string, Shelf>;
+};
+
+type AppMode = "admin-free" | "admin-path-edit" | "admin-pano-edit" | "playback" | "panorama";
+
+const STORAGE_KEY = "warehouse-router-config";
+
+const defaultConfig: Config = {
+  glbUrl: null,
+  homePosition: { x: 0, y: 2, z: 5 },
+  homeLookAt: { x: 0, y: 1, z: 0 },
+  shelves: {},
+};
+
+function loadConfig(): Config {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return { ...defaultConfig, ...JSON.parse(raw) };
+  } catch (e) {
+    console.warn("Failed to load config", e);
+  }
+  return defaultConfig;
+}
+
+function saveConfig(cfg: Config) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+  } catch (e) {
+    console.warn("Failed to save config", e);
+  }
+}
+
+function v3(x: number, y: number, z: number): Vec3 {
+  return { x, y, z };
+}
+
+function toV3(v: THREE.Vector3): Vec3 {
+  return { x: v.x, y: v.y, z: v.z };
+}
+
+function fromV3(v: Vec3): THREE.Vector3 {
+  return new THREE.Vector3(v.x, v.y, v.z);
+}
+
+export default function App() {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const panoMountRef = useRef<HTMLDivElement | null>(null);
+
+  const [config, setConfig] = useState<Config>(() => loadConfig());
+  const [mode, setMode] = useState<AppMode>("admin-free");
+  const [activeShelfId, setActiveShelfId] = useState<string | null>(null);
+  const [newShelfId, setNewShelfId] = useState("");
+  const [newShelfBarcode, setNewShelfBarcode] = useState("");
+  const [runtimeQuery, setRuntimeQuery] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
+  const [panel, setPanel] = useState<"admin" | "runtime">("admin");
+
+  // Three.js refs
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const glbRootRef = useRef<THREE.Object3D | null>(null);
+  const splineLineRef = useRef<THREE.Line | null>(null);
+  const waypointMarkersRef = useRef<THREE.Group | null>(null);
+  const lookAtMarkerRef = useRef<THREE.Object3D | null>(null);
+
+  // Free-fly state
+  const keysRef = useRef<Record<string, boolean>>({});
+  const yawRef = useRef(0);
+  const pitchRef = useRef(0);
+  const isPointerLockedRef = useRef(false);
+  const playbackRef = useRef<{
+    active: boolean;
+    curve: THREE.CatmullRomCurve3 | null;
+    duration: number;
+    startTime: number;
+    startQuat: THREE.Quaternion;
+    endLookAt: THREE.Vector3 | null;
+    onComplete: (() => void) | null;
+    reverse: boolean;
+  }>({
+    active: false,
+    curve: null,
+    duration: 0,
+    startTime: 0,
+    startQuat: new THREE.Quaternion(),
+    endLookAt: null,
+    onComplete: null,
+    reverse: false,
+  });
+
+  // Panorama state
+  const panoSceneRef = useRef<THREE.Scene | null>(null);
+  const panoCameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const panoRendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const panoYawRef = useRef(0);
+  const panoPitchRef = useRef(0);
+  const panoFovRef = useRef(75);
+  const panoMarkerRef = useRef<THREE.Sprite | null>(null);
+  const panoSphereRef = useRef<THREE.Mesh | null>(null);
+
+  const modeRef = useRef<AppMode>(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  const activeShelfIdRef = useRef<string | null>(activeShelfId);
+  useEffect(() => {
+    activeShelfIdRef.current = activeShelfId;
+  }, [activeShelfId]);
+
+  // Persist config
+  useEffect(() => {
+    saveConfig(config);
+  }, [config]);
+
+  // ---------- Three.js Setup ----------
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1d22);
+    scene.fog = new THREE.Fog(0x1a1d22, 30, 200);
+    sceneRef.current = scene;
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      mount.clientWidth / mount.clientHeight,
+      0.05,
+      1000,
+    );
+    camera.position.set(
+      config.homePosition.x,
+      config.homePosition.y,
+      config.homePosition.z,
+    );
+    cameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    mount.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(10, 20, 10);
+    scene.add(dir);
+
+    // Grid
+    const grid = new THREE.GridHelper(50, 50, 0x444444, 0x222222);
+    scene.add(grid);
+
+    // Waypoint markers group
+    const wpGroup = new THREE.Group();
+    scene.add(wpGroup);
+    waypointMarkersRef.current = wpGroup;
+
+    // Initial camera orientation derived from homeLookAt
+    {
+      const lookDir = new THREE.Vector3()
+        .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
+        .normalize();
+      yawRef.current = Math.atan2(-lookDir.x, -lookDir.z);
+      pitchRef.current = Math.asin(lookDir.y);
+      applyCameraRotation();
+    }
+
+    // Resize
+    const onResize = () => {
+      if (!mount || !rendererRef.current || !cameraRef.current) return;
+      const w = mount.clientWidth;
+      const h = mount.clientHeight;
+      rendererRef.current.setSize(w, h);
+      cameraRef.current.aspect = w / h;
+      cameraRef.current.updateProjectionMatrix();
+    };
+    window.addEventListener("resize", onResize);
+
+    // Render loop
+    const clock = new THREE.Clock();
+    let raf = 0;
+    const render = () => {
+      const dt = clock.getDelta();
+      updateCamera(dt);
+      updatePlayback();
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
+      raf = requestAnimationFrame(render);
+    };
+    render();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", onResize);
+      renderer.dispose();
+      if (renderer.domElement.parentNode === mount) {
+        mount.removeChild(renderer.domElement);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- Load GLB ----------
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (glbRootRef.current) {
+      scene.remove(glbRootRef.current);
+      glbRootRef.current = null;
+    }
+    if (!config.glbUrl) return;
+    const loader = new GLTFLoader();
+    setStatusMsg("Loading GLB...");
+    loader.load(
+      config.glbUrl,
+      (gltf) => {
+        glbRootRef.current = gltf.scene;
+        scene.add(gltf.scene);
+        setStatusMsg("GLB loaded.");
+      },
+      undefined,
+      (err) => {
+        console.error(err);
+        setStatusMsg("Failed to load GLB.");
+      },
+    );
+  }, [config.glbUrl]);
+
+  // ---------- Update waypoint visualization on shelf change ----------
+  useEffect(() => {
+    renderWaypointVisualization();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeShelfId, config.shelves, mode]);
+
+  function renderWaypointVisualization() {
+    const scene = sceneRef.current;
+    const wpGroup = waypointMarkersRef.current;
+    if (!scene || !wpGroup) return;
+    // Clear
+    while (wpGroup.children.length) wpGroup.remove(wpGroup.children[0]);
+    if (splineLineRef.current) {
+      scene.remove(splineLineRef.current);
+      splineLineRef.current.geometry.dispose();
+      splineLineRef.current = null;
+    }
+    if (lookAtMarkerRef.current) {
+      scene.remove(lookAtMarkerRef.current);
+      lookAtMarkerRef.current = null;
+    }
+    if (
+      modeRef.current !== "admin-free" &&
+      modeRef.current !== "admin-path-edit" &&
+      modeRef.current !== "admin-pano-edit"
+    )
+      return;
+    if (!activeShelfId) return;
+    const shelf = config.shelves[activeShelfId];
+    if (!shelf) return;
+
+    const sphereGeo = new THREE.SphereGeometry(0.12, 16, 16);
+    shelf.waypoints.forEach((wp, i) => {
+      const isFirst = i === 0;
+      const isLast = i === shelf.waypoints.length - 1;
+      const color = isFirst ? 0x22c55e : isLast ? 0xef4444 : 0xfacc15;
+      const mat = new THREE.MeshBasicMaterial({ color });
+      const mesh = new THREE.Mesh(sphereGeo, mat);
+      mesh.position.set(wp.x, wp.y, wp.z);
+      wpGroup.add(mesh);
+    });
+
+    if (shelf.waypoints.length >= 2) {
+      const points = shelf.waypoints.map((w) => fromV3(w));
+      const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
+      const samples = curve.getPoints(Math.max(64, shelf.waypoints.length * 16));
+      const geo = new THREE.BufferGeometry().setFromPoints(samples);
+      const mat = new THREE.LineBasicMaterial({ color: 0x60a5fa });
+      const line = new THREE.Line(geo, mat);
+      scene.add(line);
+      splineLineRef.current = line;
+    }
+
+    if (shelf.lookAt) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.18, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0x06b6d4, wireframe: true }),
+      );
+      m.position.set(shelf.lookAt.x, shelf.lookAt.y, shelf.lookAt.z);
+      scene.add(m);
+      lookAtMarkerRef.current = m;
+    }
+  }
+
+  // ---------- Camera control (free-fly) ----------
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      keysRef.current[e.code] = true;
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keysRef.current[e.code] = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+
+  function applyCameraRotation() {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    const euler = new THREE.Euler(pitchRef.current, yawRef.current, 0, "YXZ");
+    cam.quaternion.setFromEuler(euler);
+  }
+
+  function updateCamera(dt: number) {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    if (playbackRef.current.active) return;
+    const m = modeRef.current;
+    const adminFree = m === "admin-free" || m === "admin-path-edit";
+    if (!adminFree) return;
+
+    const speed = (keysRef.current["ShiftLeft"] ? 8 : 3) * dt;
+
+    // Movement vectors based on yaw only (so WASD is horizontal)
+    const forward = new THREE.Vector3(
+      -Math.sin(yawRef.current),
+      0,
+      -Math.cos(yawRef.current),
+    );
+    const right = new THREE.Vector3(
+      Math.cos(yawRef.current),
+      0,
+      -Math.sin(yawRef.current),
+    );
+
+    if (keysRef.current["KeyW"]) cam.position.addScaledVector(forward, speed);
+    if (keysRef.current["KeyS"]) cam.position.addScaledVector(forward, -speed);
+    if (keysRef.current["KeyA"]) cam.position.addScaledVector(right, -speed);
+    if (keysRef.current["KeyD"]) cam.position.addScaledVector(right, speed);
+    if (keysRef.current["KeyE"]) cam.position.y += speed;
+    if (keysRef.current["KeyQ"]) cam.position.y -= speed;
+  }
+
+  // ---------- Pointer lock for mouse look ----------
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const dom = renderer.domElement;
+    const onClick = () => {
+      const m = modeRef.current;
+      if (m === "admin-free" || m === "admin-path-edit") {
+        dom.requestPointerLock();
+      }
+    };
+    const onLockChange = () => {
+      isPointerLockedRef.current = document.pointerLockElement === dom;
+    };
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isPointerLockedRef.current) return;
+      yawRef.current -= e.movementX * 0.0025;
+      pitchRef.current -= e.movementY * 0.0025;
+      pitchRef.current = Math.max(
+        -Math.PI / 2 + 0.01,
+        Math.min(Math.PI / 2 - 0.01, pitchRef.current),
+      );
+      applyCameraRotation();
+    };
+    const onWheel = (e: WheelEvent) => {
+      const m = modeRef.current;
+      if (m !== "admin-free" && m !== "admin-path-edit") return;
+      const cam = cameraRef.current;
+      if (!cam) return;
+      e.preventDefault();
+      cam.fov = Math.max(20, Math.min(110, cam.fov + e.deltaY * 0.05));
+      cam.updateProjectionMatrix();
+    };
+    dom.addEventListener("click", onClick);
+    document.addEventListener("pointerlockchange", onLockChange);
+    document.addEventListener("mousemove", onMouseMove);
+    dom.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      dom.removeEventListener("click", onClick);
+      document.removeEventListener("pointerlockchange", onLockChange);
+      document.removeEventListener("mousemove", onMouseMove);
+      dom.removeEventListener("wheel", onWheel);
+    };
+  }, []);
+
+  // ---------- Playback (spline traversal) ----------
+  function updatePlayback() {
+    const pb = playbackRef.current;
+    const cam = cameraRef.current;
+    if (!pb.active || !pb.curve || !cam) return;
+    const t = Math.min(1, (performance.now() - pb.startTime) / pb.duration);
+    const eased = easeInOutCubic(t);
+    const u = pb.reverse ? 1 - eased : eased;
+    const pos = pb.curve.getPoint(u);
+    cam.position.copy(pos);
+
+    if (pb.endLookAt) {
+      // Smoothly rotate from start orientation to look at the target by end of playback
+      const targetQuat = new THREE.Quaternion();
+      const m = new THREE.Matrix4().lookAt(
+        pos,
+        pb.endLookAt,
+        new THREE.Vector3(0, 1, 0),
+      );
+      targetQuat.setFromRotationMatrix(m);
+      // For non-final segments, look toward the next point along the path
+      if (t < 1) {
+        const nextU = Math.min(1, u + (pb.reverse ? -0.02 : 0.02));
+        const ahead = pb.curve.getPoint(nextU);
+        const m2 = new THREE.Matrix4().lookAt(
+          pos,
+          ahead,
+          new THREE.Vector3(0, 1, 0),
+        );
+        const lookQuat = new THREE.Quaternion().setFromRotationMatrix(m2);
+        // Blend between path-look and final-look near the end
+        const finalBlend = Math.max(0, (t - 0.7) / 0.3);
+        lookQuat.slerp(targetQuat, finalBlend);
+        cam.quaternion.copy(lookQuat);
+      } else {
+        cam.quaternion.copy(targetQuat);
+      }
+    } else {
+      // Look ahead along path
+      const nextU = Math.min(1, Math.max(0, u + (pb.reverse ? -0.02 : 0.02)));
+      const ahead = pb.curve.getPoint(nextU);
+      cam.lookAt(ahead);
+    }
+
+    if (t >= 1) {
+      pb.active = false;
+      const cb = pb.onComplete;
+      pb.onComplete = null;
+      // Sync yaw/pitch with current quaternion so free-fly resumes smoothly
+      const e = new THREE.Euler().setFromQuaternion(cam.quaternion, "YXZ");
+      yawRef.current = e.y;
+      pitchRef.current = e.x;
+      if (cb) cb();
+    }
+  }
+
+  function easeInOutCubic(x: number) {
+    return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+  }
+
+  function startPlayback(
+    waypoints: Vec3[],
+    lookAt: Vec3 | null,
+    onDone: () => void,
+    reverse = false,
+  ) {
+    if (waypoints.length < 2) {
+      setStatusMsg("Need at least 2 waypoints for playback.");
+      onDone();
+      return;
+    }
+    const points = waypoints.map((w) => fromV3(w));
+    const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
+    // Duration scales with path length
+    const length = curve.getLength();
+    const duration = Math.max(1500, Math.min(8000, length * 400));
+    const cam = cameraRef.current!;
+    playbackRef.current = {
+      active: true,
+      curve,
+      duration,
+      startTime: performance.now(),
+      startQuat: cam.quaternion.clone(),
+      endLookAt: lookAt ? fromV3(lookAt) : null,
+      onComplete: onDone,
+      reverse,
+    };
+    setMode("playback");
+  }
+
+  // ---------- Admin actions ----------
+  function createShelf() {
+    const id = newShelfId.trim();
+    if (!id) {
+      setStatusMsg("Enter a shelf ID.");
+      return;
+    }
+    if (config.shelves[id]) {
+      setStatusMsg(`Shelf ${id} already exists.`);
+      setActiveShelfId(id);
+      return;
+    }
+    const shelf: Shelf = {
+      id,
+      barcode: newShelfBarcode.trim(),
+      waypoints: [],
+      lookAt: null,
+      panoramaUrl: null,
+      panoramaYaw: 0,
+      panoramaPitch: 0,
+      panoramaFov: 75,
+      markerYaw: null,
+      markerPitch: null,
+    };
+    setConfig((c) => ({ ...c, shelves: { ...c.shelves, [id]: shelf } }));
+    setActiveShelfId(id);
+    setNewShelfId("");
+    setNewShelfBarcode("");
+    setStatusMsg(`Created shelf ${id}.`);
+  }
+
+  function deleteShelf(id: string) {
+    setConfig((c) => {
+      const next = { ...c.shelves };
+      delete next[id];
+      return { ...c, shelves: next };
+    });
+    if (activeShelfId === id) setActiveShelfId(null);
+  }
+
+  function addWaypoint() {
+    if (!activeShelfId) return;
+    const cam = cameraRef.current;
+    if (!cam) return;
+    const wp = toV3(cam.position);
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: {
+            ...shelf,
+            waypoints: [...shelf.waypoints, wp],
+          },
+        },
+      };
+    });
+    setStatusMsg(`Waypoint added at (${wp.x.toFixed(2)}, ${wp.y.toFixed(2)}, ${wp.z.toFixed(2)}).`);
+  }
+
+  function removeLastWaypoint() {
+    if (!activeShelfId) return;
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: {
+            ...shelf,
+            waypoints: shelf.waypoints.slice(0, -1),
+          },
+        },
+      };
+    });
+  }
+
+  function clearWaypoints() {
+    if (!activeShelfId) return;
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: { ...shelf, waypoints: [] },
+        },
+      };
+    });
+  }
+
+  function setLookAtTarget() {
+    if (!activeShelfId) return;
+    const cam = cameraRef.current;
+    if (!cam) return;
+    // Cast a ray forward and use a point ~3m in front as look target
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const target = cam.position.clone().add(dir.multiplyScalar(3));
+    const v = toV3(target);
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: { ...shelf, lookAt: v },
+        },
+      };
+    });
+    setStatusMsg(`LookAt set to (${v.x.toFixed(2)}, ${v.y.toFixed(2)}, ${v.z.toFixed(2)}).`);
+  }
+
+  function setHomeFromCamera() {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    const pos = toV3(cam.position);
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const lookAt = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
+    setConfig((c) => ({ ...c, homePosition: pos, homeLookAt: lookAt }));
+    setStatusMsg("Home position updated.");
+  }
+
+  function gotoHome() {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    cam.position.set(
+      config.homePosition.x,
+      config.homePosition.y,
+      config.homePosition.z,
+    );
+    const dir = new THREE.Vector3()
+      .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
+      .normalize();
+    yawRef.current = Math.atan2(-dir.x, -dir.z);
+    pitchRef.current = Math.asin(dir.y);
+    applyCameraRotation();
+  }
+
+  // ---------- File handling ----------
+  function onGlbUpload(file: File) {
+    const url = URL.createObjectURL(file);
+    setConfig((c) => ({ ...c, glbUrl: url }));
+  }
+
+  function onPanoUpload(file: File) {
+    if (!activeShelfId) return;
+    const url = URL.createObjectURL(file);
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: { ...shelf, panoramaUrl: url },
+        },
+      };
+    });
+    setStatusMsg("Panorama image loaded.");
+  }
+
+  function exportConfig() {
+    // Strip blob: URLs since they aren't portable
+    const cleaned: Config = {
+      ...config,
+      glbUrl: config.glbUrl?.startsWith("blob:") ? null : config.glbUrl,
+      shelves: Object.fromEntries(
+        Object.entries(config.shelves).map(([k, s]) => [
+          k,
+          {
+            ...s,
+            panoramaUrl: s.panoramaUrl?.startsWith("blob:") ? null : s.panoramaUrl,
+          },
+        ]),
+      ),
+    };
+    const blob = new Blob([JSON.stringify(cleaned, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "warehouse-config.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importConfig(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        setConfig({ ...defaultConfig, ...parsed });
+        setStatusMsg("Config loaded.");
+      } catch (e) {
+        setStatusMsg("Failed to parse config JSON.");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // ---------- Runtime: run path to shelf ----------
+  function runRuntime(query: string) {
+    const q = query.trim().toLowerCase();
+    if (!q) return;
+    const match = Object.values(config.shelves).find(
+      (s) => s.id.toLowerCase() === q || s.barcode.toLowerCase() === q,
+    );
+    if (!match) {
+      setStatusMsg(`No shelf found for "${query}".`);
+      return;
+    }
+    if (match.waypoints.length < 2) {
+      setStatusMsg(`Shelf ${match.id} has fewer than 2 waypoints.`);
+      return;
+    }
+    setActiveShelfId(match.id);
+    // Build path: from current home->waypoints
+    const fullPath: Vec3[] = [];
+    fullPath.push(toV3(cameraRef.current!.position));
+    fullPath.push(...match.waypoints);
+    startPlayback(fullPath, match.lookAt, () => {
+      // Transition to panorama if available
+      if (match.panoramaUrl) {
+        enterPanorama(match);
+      } else {
+        setMode("admin-free");
+        setStatusMsg(`Arrived at ${match.id}. No panorama assigned.`);
+      }
+    });
+  }
+
+  function returnHome() {
+    const shelf = activeShelfId ? config.shelves[activeShelfId] : null;
+    exitPanorama();
+    if (!shelf || shelf.waypoints.length < 2) {
+      gotoHome();
+      setMode("admin-free");
+      return;
+    }
+    // Reverse path: from current shelf back to home position
+    const reversePath: Vec3[] = [...shelf.waypoints, config.homePosition];
+    startPlayback(reversePath, config.homeLookAt, () => {
+      setMode("admin-free");
+      setStatusMsg("Returned home.");
+    }, false);
+  }
+
+  // ---------- Panorama ----------
+  useEffect(() => {
+    const mount = panoMountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    panoSceneRef.current = scene;
+    const camera = new THREE.PerspectiveCamera(
+      75,
+      mount.clientWidth / mount.clientHeight,
+      0.1,
+      1100,
+    );
+    camera.position.set(0, 0, 0);
+    panoCameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    mount.appendChild(renderer.domElement);
+    panoRendererRef.current = renderer;
+
+    const geo = new THREE.SphereGeometry(500, 60, 40);
+    geo.scale(-1, 1, 1);
+    const mat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+    const sphere = new THREE.Mesh(geo, mat);
+    scene.add(sphere);
+    panoSphereRef.current = sphere;
+
+    // Marker sprite
+    const markerCanvas = document.createElement("canvas");
+    markerCanvas.width = 64;
+    markerCanvas.height = 64;
+    const ctx = markerCanvas.getContext("2d")!;
+    const grad = ctx.createRadialGradient(32, 32, 4, 32, 32, 30);
+    grad.addColorStop(0, "rgba(239,68,68,1)");
+    grad.addColorStop(0.4, "rgba(239,68,68,0.9)");
+    grad.addColorStop(1, "rgba(239,68,68,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const mTex = new THREE.CanvasTexture(markerCanvas);
+    const sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: mTex, depthTest: false, depthWrite: false }),
+    );
+    sprite.scale.set(20, 20, 1);
+    sprite.visible = false;
+    scene.add(sprite);
+    panoMarkerRef.current = sprite;
+
+    const onResize = () => {
+      if (!mount || !panoRendererRef.current || !panoCameraRef.current) return;
+      panoRendererRef.current.setSize(mount.clientWidth, mount.clientHeight);
+      panoCameraRef.current.aspect = mount.clientWidth / mount.clientHeight;
+      panoCameraRef.current.updateProjectionMatrix();
+    };
+    window.addEventListener("resize", onResize);
+
+    let raf = 0;
+    const render = () => {
+      const m = modeRef.current;
+      if (m === "panorama" || m === "admin-pano-edit") {
+        const cam = panoCameraRef.current!;
+        cam.fov = panoFovRef.current;
+        cam.updateProjectionMatrix();
+        const euler = new THREE.Euler(
+          panoPitchRef.current,
+          panoYawRef.current,
+          0,
+          "YXZ",
+        );
+        cam.quaternion.setFromEuler(euler);
+        panoRendererRef.current!.render(panoSceneRef.current!, cam);
+      }
+      raf = requestAnimationFrame(render);
+    };
+    render();
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", onResize);
+      renderer.dispose();
+      if (renderer.domElement.parentNode === mount) {
+        mount.removeChild(renderer.domElement);
+      }
+    };
+  }, []);
+
+  // Drag-to-look on panorama
+  useEffect(() => {
+    const mount = panoMountRef.current;
+    if (!mount) return;
+    let dragging = false;
+    let lx = 0;
+    let ly = 0;
+
+    const onDown = (e: MouseEvent) => {
+      // Click-to-place marker in pano editor mode (with Shift held = drag, otherwise place if alt)
+      if (modeRef.current === "admin-pano-edit" && e.button === 0 && !e.shiftKey) {
+        // Determine: click places marker, shift-drag rotates
+        placeMarkerAtScreen(e);
+        return;
+      }
+      dragging = true;
+      lx = e.clientX;
+      ly = e.clientY;
+    };
+    const onMove = (e: MouseEvent) => {
+      if (!dragging) return;
+      const dx = e.clientX - lx;
+      const dy = e.clientY - ly;
+      lx = e.clientX;
+      ly = e.clientY;
+      panoYawRef.current -= dx * 0.005;
+      panoPitchRef.current -= dy * 0.005;
+      panoPitchRef.current = Math.max(
+        -Math.PI / 2 + 0.01,
+        Math.min(Math.PI / 2 - 0.01, panoPitchRef.current),
+      );
+    };
+    const onUp = () => {
+      dragging = false;
+    };
+    const onWheel = (e: WheelEvent) => {
+      const m = modeRef.current;
+      if (m !== "panorama" && m !== "admin-pano-edit") return;
+      e.preventDefault();
+      panoFovRef.current = Math.max(
+        20,
+        Math.min(110, panoFovRef.current + e.deltaY * 0.05),
+      );
+    };
+    mount.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    mount.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      mount.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      mount.removeEventListener("wheel", onWheel);
+    };
+  }, []);
+
+  function placeMarkerAtScreen(e: MouseEvent) {
+    const mount = panoMountRef.current;
+    const cam = panoCameraRef.current;
+    if (!mount || !cam) return;
+    const rect = mount.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(ndc, cam);
+    const dir = raycaster.ray.direction.clone().normalize();
+    // Convert to yaw/pitch relative to sphere center
+    const pitch = Math.asin(dir.y);
+    const yaw = Math.atan2(-dir.x, -dir.z);
+    if (!activeShelfIdRef.current) return;
+    const id = activeShelfIdRef.current;
+    setConfig((c) => {
+      const shelf = c.shelves[id];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [id]: { ...shelf, markerYaw: yaw, markerPitch: pitch },
+        },
+      };
+    });
+    updateMarkerSprite(yaw, pitch);
+    setStatusMsg("Marker placed.");
+  }
+
+  function updateMarkerSprite(yaw: number | null, pitch: number | null) {
+    const sprite = panoMarkerRef.current;
+    if (!sprite) return;
+    if (yaw === null || pitch === null) {
+      sprite.visible = false;
+      return;
+    }
+    const r = 480;
+    const x = -r * Math.cos(pitch) * Math.sin(yaw);
+    const y = r * Math.sin(pitch);
+    const z = -r * Math.cos(pitch) * Math.cos(yaw);
+    sprite.position.set(x, y, z);
+    sprite.visible = true;
+  }
+
+  // Load panorama texture when active shelf or pano url changes (and we are in pano modes)
+  useEffect(() => {
+    if (!panoSphereRef.current) return;
+    const sphere = panoSphereRef.current;
+    const oldMat = sphere.material as THREE.MeshBasicMaterial;
+    if (!activeShelfId) {
+      oldMat.color.set(0x222222);
+      oldMat.map = null;
+      oldMat.needsUpdate = true;
+      updateMarkerSprite(null, null);
+      return;
+    }
+    const shelf = config.shelves[activeShelfId];
+    if (!shelf || !shelf.panoramaUrl) {
+      oldMat.color.set(0x222222);
+      oldMat.map = null;
+      oldMat.needsUpdate = true;
+      updateMarkerSprite(null, null);
+      return;
+    }
+    const loader = new THREE.TextureLoader();
+    loader.load(shelf.panoramaUrl, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      oldMat.map = tex;
+      oldMat.color.set(0xffffff);
+      oldMat.needsUpdate = true;
+    });
+    updateMarkerSprite(shelf.markerYaw, shelf.markerPitch);
+  }, [activeShelfId, config.shelves]);
+
+  function enterPanorama(shelf: Shelf) {
+    panoYawRef.current = shelf.panoramaYaw;
+    panoPitchRef.current = shelf.panoramaPitch;
+    panoFovRef.current = shelf.panoramaFov || 75;
+    updateMarkerSprite(shelf.markerYaw, shelf.markerPitch);
+    setMode("panorama");
+  }
+
+  function exitPanorama() {
+    if (modeRef.current === "panorama" || modeRef.current === "admin-pano-edit") {
+      setMode("admin-free");
+    }
+  }
+
+  function setRotationPreset() {
+    if (!activeShelfId) return;
+    const yaw = panoYawRef.current;
+    const pitch = panoPitchRef.current;
+    const fov = panoFovRef.current;
+    setConfig((c) => {
+      const shelf = c.shelves[activeShelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [activeShelfId]: {
+            ...shelf,
+            panoramaYaw: yaw,
+            panoramaPitch: pitch,
+            panoramaFov: fov,
+          },
+        },
+      };
+    });
+    setStatusMsg("Rotation preset saved.");
+  }
+
+  function startPathEdit() {
+    if (!activeShelfId) {
+      setStatusMsg("Select or create a shelf first.");
+      return;
+    }
+    setMode("admin-path-edit");
+  }
+
+  function startPanoEdit() {
+    if (!activeShelfId) {
+      setStatusMsg("Select or create a shelf first.");
+      return;
+    }
+    const shelf = config.shelves[activeShelfId];
+    if (shelf) {
+      panoYawRef.current = shelf.panoramaYaw;
+      panoPitchRef.current = shelf.panoramaPitch;
+      panoFovRef.current = shelf.panoramaFov || 75;
+    }
+    setMode("admin-pano-edit");
+  }
+
+  // ---------- UI ----------
+  const activeShelf = activeShelfId ? config.shelves[activeShelfId] : null;
+  const showPano = mode === "panorama" || mode === "admin-pano-edit";
+
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      {/* 3D Scene */}
+      <div
+        ref={mountRef}
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: showPano ? "none" : "block",
+        }}
+      />
+      {/* Panorama */}
+      <div
+        ref={panoMountRef}
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: showPano ? "block" : "none",
+          cursor: mode === "admin-pano-edit" ? "crosshair" : "grab",
+        }}
+      />
+
+      {/* Top bar */}
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          left: 12,
+          right: 12,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 12,
+          pointerEvents: "none",
+        }}
+      >
+        <div className="panel" style={{ pointerEvents: "auto", minWidth: 280 }}>
+          <div className="row" style={{ marginBottom: 8 }}>
+            <button
+              className={panel === "admin" ? "primary" : ""}
+              onClick={() => setPanel("admin")}
+            >
+              Admin
+            </button>
+            <button
+              className={panel === "runtime" ? "primary" : ""}
+              onClick={() => setPanel("runtime")}
+            >
+              Runtime
+            </button>
+            <div style={{ flex: 1 }} />
+            <span className="muted">
+              Mode: <strong style={{ color: "#e6e8eb" }}>{mode}</strong>
+            </span>
+          </div>
+
+          {panel === "admin" && (
+            <AdminPanel
+              config={config}
+              activeShelf={activeShelf}
+              activeShelfId={activeShelfId}
+              setActiveShelfId={setActiveShelfId}
+              newShelfId={newShelfId}
+              setNewShelfId={setNewShelfId}
+              newShelfBarcode={newShelfBarcode}
+              setNewShelfBarcode={setNewShelfBarcode}
+              createShelf={createShelf}
+              deleteShelf={deleteShelf}
+              addWaypoint={addWaypoint}
+              removeLastWaypoint={removeLastWaypoint}
+              clearWaypoints={clearWaypoints}
+              setLookAtTarget={setLookAtTarget}
+              setHomeFromCamera={setHomeFromCamera}
+              gotoHome={gotoHome}
+              startPathEdit={startPathEdit}
+              startPanoEdit={startPanoEdit}
+              setRotationPreset={setRotationPreset}
+              onGlbUpload={onGlbUpload}
+              onPanoUpload={onPanoUpload}
+              exportConfig={exportConfig}
+              importConfig={importConfig}
+              mode={mode}
+              setMode={setMode}
+            />
+          )}
+
+          {panel === "runtime" && (
+            <RuntimePanel
+              query={runtimeQuery}
+              setQuery={setRuntimeQuery}
+              run={runRuntime}
+              shelves={Object.values(config.shelves)}
+              returnHome={returnHome}
+              mode={mode}
+            />
+          )}
+        </div>
+
+        <div className="panel" style={{ pointerEvents: "auto", maxWidth: 320 }}>
+          <h3>Controls</h3>
+          {mode === "admin-free" || mode === "admin-path-edit" ? (
+            <div className="muted" style={{ lineHeight: 1.6 }}>
+              Click viewport to capture mouse · WASD = move · Q/E = down/up ·
+              Shift = sprint · Mouse = look · Wheel = FOV · Esc = release
+            </div>
+          ) : mode === "admin-pano-edit" ? (
+            <div className="muted" style={{ lineHeight: 1.6 }}>
+              Click = place marker · Shift+Drag = rotate view · Wheel = zoom
+            </div>
+          ) : mode === "panorama" ? (
+            <div className="muted" style={{ lineHeight: 1.6 }}>
+              Drag = look around · Wheel = zoom
+            </div>
+          ) : (
+            <div className="muted">Camera in motion...</div>
+          )}
+        </div>
+      </div>
+
+      {/* Status bar */}
+      {statusMsg && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(15,17,21,0.92)",
+            border: "1px solid #2a3038",
+            padding: "8px 14px",
+            borderRadius: 6,
+            fontSize: 12,
+            pointerEvents: "auto",
+          }}
+        >
+          {statusMsg}
+        </div>
+      )}
+
+      {/* Center crosshair in path-edit mode */}
+      {(mode === "admin-free" || mode === "admin-path-edit") && (
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "50%",
+            transform: "translate(-50%, -50%)",
+            width: 12,
+            height: 12,
+            border: "1px solid rgba(255,255,255,0.5)",
+            borderRadius: "50%",
+            pointerEvents: "none",
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------- Admin panel ----------------
+function AdminPanel(props: {
+  config: Config;
+  activeShelf: Shelf | null;
+  activeShelfId: string | null;
+  setActiveShelfId: (id: string | null) => void;
+  newShelfId: string;
+  setNewShelfId: (s: string) => void;
+  newShelfBarcode: string;
+  setNewShelfBarcode: (s: string) => void;
+  createShelf: () => void;
+  deleteShelf: (id: string) => void;
+  addWaypoint: () => void;
+  removeLastWaypoint: () => void;
+  clearWaypoints: () => void;
+  setLookAtTarget: () => void;
+  setHomeFromCamera: () => void;
+  gotoHome: () => void;
+  startPathEdit: () => void;
+  startPanoEdit: () => void;
+  setRotationPreset: () => void;
+  onGlbUpload: (f: File) => void;
+  onPanoUpload: (f: File) => void;
+  exportConfig: () => void;
+  importConfig: (f: File) => void;
+  mode: AppMode;
+  setMode: (m: AppMode) => void;
+}) {
+  const {
+    config,
+    activeShelf,
+    activeShelfId,
+    setActiveShelfId,
+    newShelfId,
+    setNewShelfId,
+    newShelfBarcode,
+    setNewShelfBarcode,
+    createShelf,
+    deleteShelf,
+    addWaypoint,
+    removeLastWaypoint,
+    clearWaypoints,
+    setLookAtTarget,
+    setHomeFromCamera,
+    gotoHome,
+    startPathEdit,
+    startPanoEdit,
+    setRotationPreset,
+    onGlbUpload,
+    onPanoUpload,
+    exportConfig,
+    importConfig,
+    mode,
+    setMode,
+  } = props;
+
+  const shelfList = Object.values(config.shelves);
+
+  return (
+    <div className="col">
+      <h4>Warehouse Model</h4>
+      <div className="row">
+        <label
+          className="primary"
+          style={{
+            display: "inline-block",
+            color: "#fff",
+            background: "#2563eb",
+            padding: "6px 10px",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 12,
+            textTransform: "none",
+            letterSpacing: 0,
+            fontWeight: 500,
+          }}
+        >
+          Upload GLB
+          <input
+            type="file"
+            accept=".glb,.gltf"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onGlbUpload(f);
+            }}
+          />
+        </label>
+        <span className="muted" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {config.glbUrl ? "Loaded" : "No model"}
+        </span>
+      </div>
+
+      <div className="divider" />
+
+      <h4>Home Position</h4>
+      <div className="row">
+        <button onClick={setHomeFromCamera}>Set From Camera</button>
+        <button onClick={gotoHome}>Go to Home</button>
+      </div>
+
+      <div className="divider" />
+
+      <h4>Shelves</h4>
+      <div className="col">
+        <input
+          placeholder="Shelf ID (e.g. A12)"
+          value={newShelfId}
+          onChange={(e) => setNewShelfId(e.target.value)}
+        />
+        <input
+          placeholder="Barcode (optional)"
+          value={newShelfBarcode}
+          onChange={(e) => setNewShelfBarcode(e.target.value)}
+        />
+        <button className="primary" onClick={createShelf}>
+          Create / Select Shelf
+        </button>
+      </div>
+
+      {shelfList.length > 0 && (
+        <select
+          value={activeShelfId ?? ""}
+          onChange={(e) => setActiveShelfId(e.target.value || null)}
+        >
+          <option value="">— Select shelf —</option>
+          {shelfList.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.id} {s.barcode ? `(${s.barcode})` : ""}
+            </option>
+          ))}
+        </select>
+      )}
+
+      {activeShelf && (
+        <>
+          <div className="divider" />
+          <h4>
+            Editing: {activeShelf.id}
+            {activeShelf.barcode ? ` · ${activeShelf.barcode}` : ""}
+          </h4>
+
+          <div className="row">
+            <button
+              className={mode === "admin-path-edit" ? "primary" : ""}
+              onClick={startPathEdit}
+              disabled={!config.glbUrl && shelfList.length === 0}
+            >
+              3D Path Editor
+            </button>
+            <button
+              className={mode === "admin-pano-edit" ? "primary" : ""}
+              onClick={startPanoEdit}
+            >
+              360° Editor
+            </button>
+          </div>
+
+          {(mode === "admin-path-edit" || mode === "admin-free") && (
+            <div className="col">
+              <h4>Path Tools</h4>
+              <div className="row">
+                <button onClick={addWaypoint}>+ Waypoint</button>
+                <button onClick={removeLastWaypoint} disabled={!activeShelf.waypoints.length}>
+                  Undo
+                </button>
+                <button
+                  className="danger"
+                  onClick={clearWaypoints}
+                  disabled={!activeShelf.waypoints.length}
+                >
+                  Clear
+                </button>
+              </div>
+              <button onClick={setLookAtTarget}>Set LookAt Target</button>
+              <div className="muted">
+                Waypoints: {activeShelf.waypoints.length} ·{" "}
+                LookAt: {activeShelf.lookAt ? "set" : "—"}
+              </div>
+            </div>
+          )}
+
+          {mode === "admin-pano-edit" && (
+            <div className="col">
+              <h4>Panorama Tools</h4>
+              <label
+                style={{
+                  display: "inline-block",
+                  background: "#2a3038",
+                  border: "1px solid #3a414b",
+                  padding: "6px 10px",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  fontSize: 12,
+                  textTransform: "none",
+                  letterSpacing: 0,
+                  fontWeight: 500,
+                  textAlign: "center",
+                }}
+              >
+                Upload 360° Image
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) onPanoUpload(f);
+                  }}
+                />
+              </label>
+              <button onClick={setRotationPreset}>Save Rotation Preset</button>
+              <div className="muted">
+                Image: {activeShelf.panoramaUrl ? "loaded" : "—"} · Marker:{" "}
+                {activeShelf.markerYaw !== null ? "placed" : "—"}
+              </div>
+              <button onClick={() => setMode("admin-free")}>← Back to 3D</button>
+            </div>
+          )}
+
+          <button
+            className="danger"
+            onClick={() => deleteShelf(activeShelf.id)}
+          >
+            Delete Shelf
+          </button>
+        </>
+      )}
+
+      <div className="divider" />
+
+      <h4>Config</h4>
+      <div className="row">
+        <button onClick={exportConfig}>Download JSON</button>
+        <label
+          style={{
+            display: "inline-block",
+            background: "#2a3038",
+            border: "1px solid #3a414b",
+            padding: "6px 10px",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 12,
+            textTransform: "none",
+            letterSpacing: 0,
+            fontWeight: 500,
+          }}
+        >
+          Load JSON
+          <input
+            type="file"
+            accept="application/json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) importConfig(f);
+            }}
+          />
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Runtime panel ----------------
+function RuntimePanel(props: {
+  query: string;
+  setQuery: (s: string) => void;
+  run: (q: string) => void;
+  shelves: Shelf[];
+  returnHome: () => void;
+  mode: AppMode;
+}) {
+  const { query, setQuery, run, shelves, returnHome, mode } = props;
+  return (
+    <div className="col">
+      <h4>Find Shelf</h4>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          run(query);
+        }}
+        style={{ display: "flex", gap: 6 }}
+      >
+        <input
+          placeholder="Shelf ID or barcode"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          autoFocus
+        />
+        <button className="primary" type="submit" disabled={mode === "playback"}>
+          Go
+        </button>
+      </form>
+      <div className="muted">
+        {shelves.length} shelves available
+      </div>
+
+      {shelves.length > 0 && (
+        <>
+          <h4>Quick Pick</h4>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {shelves.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => run(s.id)}
+                disabled={mode === "playback" || s.waypoints.length < 2}
+                title={
+                  s.waypoints.length < 2
+                    ? "Needs ≥ 2 waypoints"
+                    : `${s.waypoints.length} waypoints`
+                }
+              >
+                {s.id}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="divider" />
+      <button onClick={returnHome} disabled={mode === "playback"}>
+        ← Return Home
+      </button>
+    </div>
+  );
+}

@@ -25,3 +25,7 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - `pnpm --filter @workspace/api-server run dev` — run API server locally
 
 See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+
+## Artifacts
+
+- **warehouse-router** (`artifacts/warehouse-router`) — Single-page Three.js tool for navigating a GLB warehouse model. Admin mode supports building Catmull-Rom spline camera paths to shelves with WASD/mouse free-fly controls, setting LookAt targets, uploading 360° equirectangular panoramas per shelf, placing marker dots, and saving rotation presets. Runtime mode lets a user enter a shelf ID/barcode to fly the camera through the saved path and transition into the panorama view. Config is persisted to localStorage and can be exported/imported as JSON.
