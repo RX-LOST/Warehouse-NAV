@@ -1239,23 +1239,47 @@ export default function App() {
         }}
       >
         <div className="panel" style={{ pointerEvents: "auto", minWidth: 280 }}>
-          <div className="row" style={{ marginBottom: 8 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 6,
+              marginBottom: 10,
+              padding: 4,
+              background: "#1a1d22",
+              borderRadius: 6,
+              border: "1px solid #2a3038",
+            }}
+          >
             <button
-              className={panel === "admin" ? "primary" : ""}
-              onClick={() => setPanel("admin")}
-            >
-              Admin
-            </button>
-            <button
-              className={panel === "runtime" ? "primary" : ""}
               onClick={() => setPanel("runtime")}
+              style={{
+                padding: "8px 12px",
+                fontSize: 13,
+                fontWeight: 600,
+                background: panel === "runtime" ? "#2563eb" : "transparent",
+                borderColor: panel === "runtime" ? "#2563eb" : "transparent",
+                color: panel === "runtime" ? "#fff" : "#9ca3af",
+              }}
             >
               Runtime
             </button>
-            <div style={{ flex: 1 }} />
-            <span className="muted">
-              Mode: <strong style={{ color: "#e6e8eb" }}>{mode}</strong>
-            </span>
+            <button
+              onClick={() => setPanel("admin")}
+              style={{
+                padding: "8px 12px",
+                fontSize: 13,
+                fontWeight: 600,
+                background: panel === "admin" ? "#2563eb" : "transparent",
+                borderColor: panel === "admin" ? "#2563eb" : "transparent",
+                color: panel === "admin" ? "#fff" : "#9ca3af",
+              }}
+            >
+              Admin
+            </button>
+          </div>
+          <div className="muted" style={{ marginBottom: 8, fontSize: 10 }}>
+            Mode: <strong style={{ color: "#e6e8eb" }}>{mode}</strong>
           </div>
 
           {panel === "admin" && (
