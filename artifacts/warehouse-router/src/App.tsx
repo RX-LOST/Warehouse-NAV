@@ -1236,6 +1236,7 @@ export default function App() {
           alignItems: "flex-start",
           gap: 12,
           pointerEvents: "none",
+          zIndex: 10,
         }}
       >
         <div className="panel" style={{ pointerEvents: "auto", minWidth: 280 }}>
@@ -1359,6 +1360,7 @@ export default function App() {
             borderRadius: 6,
             fontSize: 12,
             pointerEvents: "auto",
+            zIndex: 10,
           }}
         >
           {statusMsg}
