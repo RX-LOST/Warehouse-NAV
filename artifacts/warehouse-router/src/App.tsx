@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
@@ -15,6 +15,8 @@ type Shelf = {
   panoramaFov: number;
   markerYaw: number | null;
   markerPitch: number | null;
+  durationSec: number;
+  tension: number;
 };
 
 type Config = {
@@ -38,7 +40,22 @@ const defaultConfig: Config = {
 function loadConfig(): Config {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { ...defaultConfig, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const merged = { ...defaultConfig, ...parsed };
+      // Backfill new shelf fields for older saved configs
+      merged.shelves = Object.fromEntries(
+        Object.entries(merged.shelves || {}).map(([k, s]) => [
+          k,
+          {
+            durationSec: 4,
+            tension: 0.5,
+            ...(s as Shelf),
+          },
+        ]),
+      );
+      return merged;
+    }
   } catch (e) {
     console.warn("Failed to load config", e);
   }
@@ -76,7 +93,8 @@ export default function App() {
   const [newShelfBarcode, setNewShelfBarcode] = useState("");
   const [runtimeQuery, setRuntimeQuery] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
-  const [panel, setPanel] = useState<"admin" | "runtime">("admin");
+  const [panel, setPanel] = useState<"admin" | "runtime">("runtime");
+  const [fadeAlpha, setFadeAlpha] = useState(0);
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -205,10 +223,12 @@ export default function App() {
     window.addEventListener("resize", onResize);
 
     // Render loop
-    const clock = new THREE.Clock();
+    let lastTime = performance.now();
     let raf = 0;
     const render = () => {
-      const dt = clock.getDelta();
+      const now = performance.now();
+      const dt = Math.min(0.1, (now - lastTime) / 1000);
+      lastTime = now;
       updateCamera(dt);
       updatePlayback();
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
@@ -299,7 +319,12 @@ export default function App() {
 
     if (shelf.waypoints.length >= 2) {
       const points = shelf.waypoints.map((w) => fromV3(w));
-      const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
+      const curve = new THREE.CatmullRomCurve3(
+        points,
+        false,
+        "catmullrom",
+        shelf.tension ?? 0.5,
+      );
       const samples = curve.getPoints(Math.max(64, shelf.waypoints.length * 16));
       const geo = new THREE.BufferGeometry().setFromPoints(samples);
       const mat = new THREE.LineBasicMaterial({ color: 0x60a5fa });
@@ -320,9 +345,27 @@ export default function App() {
   }
 
   // ---------- Camera control (free-fly) ----------
+  const addWaypointRef = useRef<() => void>(() => {});
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Don't trap keys when typing in an input/textarea
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT")
+      ) {
+        return;
+      }
       keysRef.current[e.code] = true;
+      // 'M' shortcut to add waypoint
+      if (e.code === "KeyM" && !e.repeat) {
+        const m = modeRef.current;
+        if (m === "admin-free" || m === "admin-path-edit") {
+          addWaypointRef.current();
+        }
+      }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       keysRef.current[e.code] = false;
@@ -379,7 +422,10 @@ export default function App() {
     const dom = renderer.domElement;
     const onClick = () => {
       const m = modeRef.current;
-      if (m === "admin-free" || m === "admin-path-edit") {
+      if (m !== "admin-free" && m !== "admin-path-edit") return;
+      if (isPointerLockedRef.current) {
+        document.exitPointerLock();
+      } else {
         dom.requestPointerLock();
       }
     };
@@ -428,41 +474,49 @@ export default function App() {
     const pos = pb.curve.getPoint(u);
     cam.position.copy(pos);
 
+    // Compute path-look quaternion (looking along the spline tangent)
+    const tangent = pb.curve.getTangent(u).normalize();
+    if (pb.reverse) tangent.multiplyScalar(-1);
+    const aheadPoint = pos.clone().add(tangent);
+    const pathMat = new THREE.Matrix4().lookAt(
+      pos,
+      aheadPoint,
+      new THREE.Vector3(0, 1, 0),
+    );
+    const pathQuat = new THREE.Quaternion().setFromRotationMatrix(pathMat);
+
+    // Final look quaternion (toward end target if provided)
+    let endQuat: THREE.Quaternion;
     if (pb.endLookAt) {
-      // Smoothly rotate from start orientation to look at the target by end of playback
-      const targetQuat = new THREE.Quaternion();
       const m = new THREE.Matrix4().lookAt(
         pos,
         pb.endLookAt,
         new THREE.Vector3(0, 1, 0),
       );
-      targetQuat.setFromRotationMatrix(m);
-      // For non-final segments, look toward the next point along the path
-      if (t < 1) {
-        const nextU = Math.min(1, u + (pb.reverse ? -0.02 : 0.02));
-        const ahead = pb.curve.getPoint(nextU);
-        const m2 = new THREE.Matrix4().lookAt(
-          pos,
-          ahead,
-          new THREE.Vector3(0, 1, 0),
-        );
-        const lookQuat = new THREE.Quaternion().setFromRotationMatrix(m2);
-        // Blend between path-look and final-look near the end
-        const finalBlend = Math.max(0, (t - 0.7) / 0.3);
-        lookQuat.slerp(targetQuat, finalBlend);
-        cam.quaternion.copy(lookQuat);
-      } else {
-        cam.quaternion.copy(targetQuat);
-      }
+      endQuat = new THREE.Quaternion().setFromRotationMatrix(m);
     } else {
-      // Look ahead along path
-      const nextU = Math.min(1, Math.max(0, u + (pb.reverse ? -0.02 : 0.02)));
-      const ahead = pb.curve.getPoint(nextU);
-      cam.lookAt(ahead);
+      endQuat = pathQuat.clone();
     }
+
+    // Smooth easing for rotation: ease in from start orientation, ease out into final
+    // 0..0.25 -> blend startQuat -> pathQuat
+    // 0.25..0.7 -> pathQuat
+    // 0.7..1 -> blend pathQuat -> endQuat
+    let q: THREE.Quaternion;
+    if (t < 0.25) {
+      const k = easeInOutCubic(t / 0.25);
+      q = pb.startQuat.clone().slerp(pathQuat, k);
+    } else if (t < 0.7) {
+      q = pathQuat;
+    } else {
+      const k = easeInOutCubic((t - 0.7) / 0.3);
+      q = pathQuat.clone().slerp(endQuat, k);
+    }
+    cam.quaternion.copy(q);
 
     if (t >= 1) {
       pb.active = false;
+      cam.quaternion.copy(endQuat);
       const cb = pb.onComplete;
       pb.onComplete = null;
       // Sync yaw/pitch with current quaternion so free-fly resumes smoothly
@@ -482,6 +536,8 @@ export default function App() {
     lookAt: Vec3 | null,
     onDone: () => void,
     reverse = false,
+    durationSec?: number,
+    tension?: number,
   ) {
     if (waypoints.length < 2) {
       setStatusMsg("Need at least 2 waypoints for playback.");
@@ -489,10 +545,13 @@ export default function App() {
       return;
     }
     const points = waypoints.map((w) => fromV3(w));
-    const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
-    // Duration scales with path length
-    const length = curve.getLength();
-    const duration = Math.max(1500, Math.min(8000, length * 400));
+    const curve = new THREE.CatmullRomCurve3(
+      points,
+      false,
+      "catmullrom",
+      tension ?? 0.5,
+    );
+    const duration = (durationSec && durationSec > 0 ? durationSec : 4) * 1000;
     const cam = cameraRef.current!;
     playbackRef.current = {
       active: true,
@@ -530,6 +589,8 @@ export default function App() {
       panoramaFov: 75,
       markerYaw: null,
       markerPitch: null,
+      durationSec: 4,
+      tension: 0.5,
     };
     setConfig((c) => ({ ...c, shelves: { ...c.shelves, [id]: shelf } }));
     setActiveShelfId(id);
@@ -548,18 +609,22 @@ export default function App() {
   }
 
   function addWaypoint() {
-    if (!activeShelfId) return;
+    const id = activeShelfIdRef.current;
+    if (!id) {
+      setStatusMsg("Select or create a shelf first.");
+      return;
+    }
     const cam = cameraRef.current;
     if (!cam) return;
     const wp = toV3(cam.position);
     setConfig((c) => {
-      const shelf = c.shelves[activeShelfId];
+      const shelf = c.shelves[id];
       if (!shelf) return c;
       return {
         ...c,
         shelves: {
           ...c.shelves,
-          [activeShelfId]: {
+          [id]: {
             ...shelf,
             waypoints: [...shelf.waypoints, wp],
           },
@@ -568,6 +633,8 @@ export default function App() {
     });
     setStatusMsg(`Waypoint added at (${wp.x.toFixed(2)}, ${wp.y.toFixed(2)}, ${wp.z.toFixed(2)}).`);
   }
+  // keep ref synced for keyboard shortcut
+  addWaypointRef.current = addWaypoint;
 
   function removeLastWaypoint() {
     if (!activeShelfId) return;
@@ -639,17 +706,29 @@ export default function App() {
   function gotoHome() {
     const cam = cameraRef.current;
     if (!cam) return;
-    cam.position.set(
-      config.homePosition.x,
-      config.homePosition.y,
-      config.homePosition.z,
+    const from = toV3(cam.position);
+    const to = config.homePosition;
+    const dist = Math.hypot(from.x - to.x, from.y - to.y, from.z - to.z);
+    if (dist < 0.05) {
+      // Already there: just face the home lookAt
+      const dir = new THREE.Vector3()
+        .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
+        .normalize();
+      yawRef.current = Math.atan2(-dir.x, -dir.z);
+      pitchRef.current = Math.asin(dir.y);
+      applyCameraRotation();
+      return;
+    }
+    startPlayback(
+      [from, to],
+      config.homeLookAt,
+      () => {
+        setMode("admin-free");
+      },
+      false,
+      Math.max(1.5, Math.min(5, dist * 0.4)),
+      0.5,
     );
-    const dir = new THREE.Vector3()
-      .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
-      .normalize();
-    yawRef.current = Math.atan2(-dir.x, -dir.z);
-    pitchRef.current = Math.asin(dir.y);
-    applyCameraRotation();
   }
 
   // ---------- File handling ----------
@@ -731,35 +810,89 @@ export default function App() {
       return;
     }
     setActiveShelfId(match.id);
-    // Build path: from current home->waypoints
+    // Build path: from current camera position -> waypoints (no teleport)
     const fullPath: Vec3[] = [];
     fullPath.push(toV3(cameraRef.current!.position));
     fullPath.push(...match.waypoints);
-    startPlayback(fullPath, match.lookAt, () => {
-      // Transition to panorama if available
-      if (match.panoramaUrl) {
-        enterPanorama(match);
-      } else {
-        setMode("admin-free");
-        setStatusMsg(`Arrived at ${match.id}. No panorama assigned.`);
-      }
-    });
+    startPlayback(
+      fullPath,
+      match.lookAt,
+      () => {
+        if (match.panoramaUrl) {
+          enterPanorama(match);
+        } else {
+          setMode("admin-free");
+          setStatusMsg(`Arrived at ${match.id}. No panorama assigned.`);
+        }
+      },
+      false,
+      match.durationSec,
+      match.tension,
+    );
   }
 
   function returnHome() {
     const shelf = activeShelfId ? config.shelves[activeShelfId] : null;
-    exitPanorama();
+    const wasPano =
+      modeRef.current === "panorama" || modeRef.current === "admin-pano-edit";
+    if (wasPano) {
+      // Fade out panorama, then exit & glide home
+      runFade(() => {
+        setMode("admin-free");
+        beginReturnHome(shelf);
+      });
+    } else {
+      beginReturnHome(shelf);
+    }
+  }
+
+  function beginReturnHome(shelf: Shelf | null) {
+    const cam = cameraRef.current!;
     if (!shelf || shelf.waypoints.length < 2) {
       gotoHome();
-      setMode("admin-free");
       return;
     }
-    // Reverse path: from current shelf back to home position
-    const reversePath: Vec3[] = [...shelf.waypoints, config.homePosition];
-    startPlayback(reversePath, config.homeLookAt, () => {
-      setMode("admin-free");
-      setStatusMsg("Returned home.");
-    }, false);
+    // Reverse path starting at the camera's current position so there is no teleport
+    const reversePath: Vec3[] = [
+      toV3(cam.position),
+      ...[...shelf.waypoints].reverse(),
+      config.homePosition,
+    ];
+    startPlayback(
+      reversePath,
+      config.homeLookAt,
+      () => {
+        setMode("admin-free");
+        setStatusMsg("Returned home.");
+      },
+      false,
+      shelf.durationSec,
+      shelf.tension,
+    );
+  }
+
+  // Quick fade-to-black overlay that runs `cb` at peak black
+  function runFade(cb: () => void) {
+    const fadeMs = 280;
+    const start = performance.now();
+    let didCb = false;
+    const tick = () => {
+      const t = (performance.now() - start) / fadeMs;
+      if (t < 0.5) {
+        setFadeAlpha(t * 2);
+        requestAnimationFrame(tick);
+      } else if (t < 1) {
+        if (!didCb) {
+          didCb = true;
+          cb();
+        }
+        setFadeAlpha((1 - t) * 2);
+        requestAnimationFrame(tick);
+      } else {
+        setFadeAlpha(0);
+      }
+    };
+    requestAnimationFrame(tick);
   }
 
   // ---------- Panorama ----------
@@ -849,6 +982,20 @@ export default function App() {
       }
     };
   }, []);
+
+  // Force pano renderer resize whenever we enter a pano mode
+  useEffect(() => {
+    if (mode !== "panorama" && mode !== "admin-pano-edit") return;
+    const mount = panoMountRef.current;
+    const renderer = panoRendererRef.current;
+    const cam = panoCameraRef.current;
+    if (!mount || !renderer || !cam) return;
+    const w = mount.clientWidth || window.innerWidth;
+    const h = mount.clientHeight || window.innerHeight;
+    renderer.setSize(w, h);
+    cam.aspect = w / h;
+    cam.updateProjectionMatrix();
+  }, [mode]);
 
   // Drag-to-look on panorama
   useEffect(() => {
@@ -988,7 +1135,10 @@ export default function App() {
     panoPitchRef.current = shelf.panoramaPitch;
     panoFovRef.current = shelf.panoramaFov || 75;
     updateMarkerSprite(shelf.markerYaw, shelf.markerPitch);
-    setMode("panorama");
+    runFade(() => {
+      setMode("panorama");
+      setStatusMsg(`Viewing panorama for ${shelf.id}.`);
+    });
   }
 
   function exitPanorama() {
@@ -1055,7 +1205,9 @@ export default function App() {
         style={{
           position: "absolute",
           inset: 0,
-          display: showPano ? "none" : "block",
+          opacity: showPano ? 0 : 1,
+          pointerEvents: showPano ? "none" : "auto",
+          zIndex: showPano ? 0 : 1,
         }}
       />
       {/* Panorama */}
@@ -1064,7 +1216,10 @@ export default function App() {
         style={{
           position: "absolute",
           inset: 0,
-          display: showPano ? "block" : "none",
+          opacity: showPano ? 1 : 0,
+          pointerEvents: showPano ? "auto" : "none",
+          zIndex: showPano ? 1 : 0,
+          display: "block",
           cursor: mode === "admin-pano-edit" ? "crosshair" : "grab",
         }}
       />
@@ -1425,6 +1580,60 @@ function AdminPanel(props: {
               <button onClick={() => setMode("admin-free")}>← Back to 3D</button>
             </div>
           )}
+
+          <div className="col">
+            <h4>Path Tuning</h4>
+            <label className="muted" style={{ display: "block" }}>
+              Duration: {activeShelf.durationSec.toFixed(1)}s
+              <input
+                type="range"
+                min={1}
+                max={15}
+                step={0.5}
+                value={activeShelf.durationSec}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setConfig((c) => {
+                    const s = c.shelves[activeShelf.id];
+                    if (!s) return c;
+                    return {
+                      ...c,
+                      shelves: {
+                        ...c.shelves,
+                        [activeShelf.id]: { ...s, durationSec: v },
+                      },
+                    };
+                  });
+                }}
+                style={{ width: "100%" }}
+              />
+            </label>
+            <label className="muted" style={{ display: "block" }}>
+              Curve tension: {activeShelf.tension.toFixed(2)}
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={activeShelf.tension}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setConfig((c) => {
+                    const s = c.shelves[activeShelf.id];
+                    if (!s) return c;
+                    return {
+                      ...c,
+                      shelves: {
+                        ...c.shelves,
+                        [activeShelf.id]: { ...s, tension: v },
+                      },
+                    };
+                  });
+                }}
+                style={{ width: "100%" }}
+              />
+            </label>
+          </div>
 
           <button
             className="danger"
