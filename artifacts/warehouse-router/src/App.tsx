@@ -19,8 +19,23 @@ type Shelf = {
   tension: number;
 };
 
+type Transform = {
+  position: Vec3;
+  rotation: Vec3; // degrees
+  scale: Vec3;
+};
+
+type SceneObject = {
+  id: string;
+  name: string;
+  url: string;
+  transform: Transform;
+};
+
 type Config = {
   glbUrl: string | null;
+  glbTransform: Transform;
+  objects: SceneObject[];
   homePosition: Vec3;
   homeLookAt: Vec3;
   shelves: Record<string, Shelf>;
@@ -28,10 +43,22 @@ type Config = {
 
 type AppMode = "admin-free" | "admin-path-edit" | "admin-pano-edit" | "playback" | "panorama";
 
+type SelectionId = "scene" | string | null;
+type TransformTool = "translate" | "rotate" | "scale";
+type TransformAxis = "x" | "y" | "z" | null;
+
 const STORAGE_KEY = "warehouse-router-config";
+
+const identityTransform = (): Transform => ({
+  position: { x: 0, y: 0, z: 0 },
+  rotation: { x: 0, y: 0, z: 0 },
+  scale: { x: 1, y: 1, z: 1 },
+});
 
 const defaultConfig: Config = {
   glbUrl: null,
+  glbTransform: identityTransform(),
+  objects: [],
   homePosition: { x: 0, y: 2, z: 5 },
   homeLookAt: { x: 0, y: 1, z: 0 },
   shelves: {},
@@ -50,10 +77,12 @@ function loadConfig(): Config {
           {
             durationSec: 4,
             tension: 0.5,
-            ...(s as Shelf),
-          },
+            ...(s as Partial<Shelf>),
+          } as Shelf,
         ]),
       );
+      if (!merged.glbTransform) merged.glbTransform = identityTransform();
+      if (!Array.isArray(merged.objects)) merged.objects = [];
       return merged;
     }
   } catch (e) {
@@ -95,6 +124,8 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState("");
   const [panel, setPanel] = useState<"admin" | "runtime">("runtime");
   const [fadeAlpha, setFadeAlpha] = useState(0);
+  const [selectedObjectId, setSelectedObjectId] = useState<SelectionId>(null);
+  const [transformHud, setTransformHud] = useState<string>("");
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -104,12 +135,35 @@ export default function App() {
   const splineLineRef = useRef<THREE.Line | null>(null);
   const waypointMarkersRef = useRef<THREE.Group | null>(null);
   const lookAtMarkerRef = useRef<THREE.Object3D | null>(null);
+  // Selectable scene objects: id -> root Object3D
+  const objectsMapRef = useRef<Map<string, THREE.Object3D>>(new Map());
+  const selectionBoxRef = useRef<THREE.BoxHelper | null>(null);
+  const selectedObjectIdRef = useRef<SelectionId>(null);
+  // Active transform gesture (Blender-style G/R/S)
+  const transformRef = useRef<{
+    active: boolean;
+    tool: TransformTool;
+    axis: TransformAxis;
+    startMouseX: number;
+    startMouseY: number;
+    targetId: SelectionId;
+    original: Transform;
+  }>({
+    active: false,
+    tool: "translate",
+    axis: null,
+    startMouseX: 0,
+    startMouseY: 0,
+    targetId: null,
+    original: identityTransform(),
+  });
 
   // Free-fly state
   const keysRef = useRef<Record<string, boolean>>({});
   const yawRef = useRef(0);
   const pitchRef = useRef(0);
   const isPointerLockedRef = useRef(false);
+  const lastMouseRef = useRef({ x: 0, y: 0 });
   const playbackRef = useRef<{
     active: boolean;
     curve: THREE.CatmullRomCurve3 | null;
@@ -149,6 +203,12 @@ export default function App() {
   useEffect(() => {
     activeShelfIdRef.current = activeShelfId;
   }, [activeShelfId]);
+
+  useEffect(() => {
+    selectedObjectIdRef.current = selectedObjectId;
+    updateSelectionBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedObjectId]);
 
   // Persist config
   useEffect(() => {
@@ -231,6 +291,9 @@ export default function App() {
       lastTime = now;
       updateCamera(dt);
       updatePlayback();
+      if (selectionBoxRef.current) {
+        (selectionBoxRef.current as THREE.BoxHelper).update();
+      }
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
         rendererRef.current.render(sceneRef.current, cameraRef.current);
       }
@@ -249,7 +312,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------- Load GLB ----------
+  // ---------- Load GLB scene ----------
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
@@ -264,7 +327,9 @@ export default function App() {
       config.glbUrl,
       (gltf) => {
         glbRootRef.current = gltf.scene;
+        applyTransformToObject(gltf.scene, config.glbTransform);
         scene.add(gltf.scene);
+        updateSelectionBox();
         setStatusMsg("GLB loaded.");
       },
       undefined,
@@ -273,7 +338,102 @@ export default function App() {
         setStatusMsg("Failed to load GLB.");
       },
     );
+    // Intentionally only re-run on glbUrl change (transform handled separately)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.glbUrl]);
+
+  // Apply scene GLB transform when it changes
+  useEffect(() => {
+    if (glbRootRef.current) {
+      applyTransformToObject(glbRootRef.current, config.glbTransform);
+      updateSelectionBox();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.glbTransform]);
+
+  // ---------- Load extra scene objects ----------
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    const map = objectsMapRef.current;
+    const wantedIds = new Set(config.objects.map((o) => o.id));
+    // Remove objects no longer in config
+    for (const [id, obj] of map.entries()) {
+      if (!wantedIds.has(id)) {
+        scene.remove(obj);
+        map.delete(id);
+      }
+    }
+    // Load/refresh each object
+    config.objects.forEach((spec) => {
+      const existing = map.get(spec.id);
+      if (existing) {
+        // Already loaded — just sync the transform
+        applyTransformToObject(existing, spec.transform);
+        return;
+      }
+      const loader = new GLTFLoader();
+      loader.load(
+        spec.url,
+        (gltf) => {
+          gltf.scene.userData.objectId = spec.id;
+          applyTransformToObject(gltf.scene, spec.transform);
+          scene.add(gltf.scene);
+          map.set(spec.id, gltf.scene);
+          updateSelectionBox();
+        },
+        undefined,
+        (err) => {
+          console.error(err);
+          setStatusMsg(`Failed to load object "${spec.name}".`);
+        },
+      );
+    });
+    updateSelectionBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.objects]);
+
+  function applyTransformToObject(obj: THREE.Object3D, t: Transform) {
+    obj.position.set(t.position.x, t.position.y, t.position.z);
+    obj.rotation.set(
+      THREE.MathUtils.degToRad(t.rotation.x),
+      THREE.MathUtils.degToRad(t.rotation.y),
+      THREE.MathUtils.degToRad(t.rotation.z),
+    );
+    obj.scale.set(t.scale.x, t.scale.y, t.scale.z);
+  }
+
+  function getSelectedObject3D(): THREE.Object3D | null {
+    const id = selectedObjectIdRef.current;
+    if (!id) return null;
+    if (id === "scene") return glbRootRef.current;
+    return objectsMapRef.current.get(id) ?? null;
+  }
+
+  function getSelectedTransformConfig(): Transform | null {
+    const id = selectedObjectIdRef.current;
+    if (!id) return null;
+    if (id === "scene") return config.glbTransform;
+    const o = config.objects.find((x) => x.id === id);
+    return o ? o.transform : null;
+  }
+
+  function updateSelectionBox() {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (selectionBoxRef.current) {
+      scene.remove(selectionBoxRef.current);
+      (selectionBoxRef.current as THREE.BoxHelper).dispose?.();
+      selectionBoxRef.current = null;
+    }
+    const obj = getSelectedObject3D();
+    if (!obj) return;
+    const helper = new THREE.BoxHelper(obj, 0xffaa00);
+    helper.material.depthTest = false;
+    helper.renderOrder = 999;
+    scene.add(helper);
+    selectionBoxRef.current = helper;
+  }
 
   // ---------- Update waypoint visualization on shelf change ----------
   useEffect(() => {
@@ -359,12 +519,52 @@ export default function App() {
         return;
       }
       keysRef.current[e.code] = true;
+      const m = modeRef.current;
+      const inAdmin = m === "admin-free" || m === "admin-path-edit";
       // 'M' shortcut to add waypoint
-      if (e.code === "KeyM" && !e.repeat) {
-        const m = modeRef.current;
-        if (m === "admin-free" || m === "admin-path-edit") {
-          addWaypointRef.current();
+      if (e.code === "KeyM" && !e.repeat && inAdmin) {
+        addWaypointRef.current();
+        return;
+      }
+      if (!inAdmin) return;
+      // Blender-style transforms (only when something is selected & not pointer-locked)
+      const tr = transformRef.current;
+      if (tr.active) {
+        if (e.code === "Escape") {
+          e.preventDefault();
+          cancelTransform();
+          return;
         }
+        if (e.code === "Enter" || e.code === "Space") {
+          e.preventDefault();
+          commitTransform();
+          return;
+        }
+        if (e.code === "KeyX" || e.code === "KeyY" || e.code === "KeyZ") {
+          e.preventDefault();
+          tr.axis = e.code === "KeyX" ? "x" : e.code === "KeyY" ? "y" : "z";
+          // Reset target to original then re-apply with new axis
+          updateTransformGesture(tr.startMouseX, tr.startMouseY);
+          // Force a refresh by re-emitting current mouse, but startMouse=>delta=0
+          updateHud();
+          return;
+        }
+        return;
+      }
+      if (
+        !e.repeat &&
+        !isPointerLockedRef.current &&
+        selectedObjectIdRef.current &&
+        (e.code === "KeyG" || e.code === "KeyR" || e.code === "KeyS")
+      ) {
+        e.preventDefault();
+        const tool: TransformTool =
+          e.code === "KeyG"
+            ? "translate"
+            : e.code === "KeyR"
+              ? "rotate"
+              : "scale";
+        startTransform(tool);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -420,27 +620,68 @@ export default function App() {
     const renderer = rendererRef.current;
     if (!renderer) return;
     const dom = renderer.domElement;
-    const onClick = () => {
+    const onMouseDown = (e: MouseEvent) => {
       const m = modeRef.current;
       if (m !== "admin-free" && m !== "admin-path-edit") return;
+      // While a transform gesture is active: LMB confirms, RMB cancels
+      if (transformRef.current.active) {
+        e.preventDefault();
+        if (e.button === 0) commitTransform();
+        else if (e.button === 2) cancelTransform();
+        return;
+      }
+      if (e.button !== 0) return;
+      // If pointer-locked, click releases lock
       if (isPointerLockedRef.current) {
         document.exitPointerLock();
+        return;
+      }
+      // Try selection raycast against scene objects
+      const hit = raycastObjects(e);
+      if (hit) {
+        setSelectedObjectId(hit);
+        setStatusMsg(
+          hit === "scene" ? "Selected: Scene" : `Selected: ${objectName(hit)}`,
+        );
+        return;
+      }
+      // Empty space: clear selection if anything selected, otherwise lock pointer
+      if (selectedObjectIdRef.current) {
+        setSelectedObjectId(null);
       } else {
         dom.requestPointerLock();
+      }
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      // Block right-click menu while in admin so RMB can cancel transforms
+      if (
+        modeRef.current === "admin-free" ||
+        modeRef.current === "admin-path-edit"
+      ) {
+        e.preventDefault();
       }
     };
     const onLockChange = () => {
       isPointerLockedRef.current = document.pointerLockElement === dom;
     };
     const onMouseMove = (e: MouseEvent) => {
-      if (!isPointerLockedRef.current) return;
-      yawRef.current -= e.movementX * 0.0025;
-      pitchRef.current -= e.movementY * 0.0025;
-      pitchRef.current = Math.max(
-        -Math.PI / 2 + 0.01,
-        Math.min(Math.PI / 2 - 0.01, pitchRef.current),
-      );
-      applyCameraRotation();
+      lastMouseRef.current.x = e.clientX;
+      lastMouseRef.current.y = e.clientY;
+      // Pointer-lock free-fly look
+      if (isPointerLockedRef.current) {
+        yawRef.current -= e.movementX * 0.0025;
+        pitchRef.current -= e.movementY * 0.0025;
+        pitchRef.current = Math.max(
+          -Math.PI / 2 + 0.01,
+          Math.min(Math.PI / 2 - 0.01, pitchRef.current),
+        );
+        applyCameraRotation();
+        return;
+      }
+      // Transform gesture
+      if (transformRef.current.active) {
+        updateTransformGesture(e.clientX, e.clientY);
+      }
     };
     const onWheel = (e: WheelEvent) => {
       const m = modeRef.current;
@@ -451,17 +692,199 @@ export default function App() {
       cam.fov = Math.max(20, Math.min(110, cam.fov + e.deltaY * 0.05));
       cam.updateProjectionMatrix();
     };
-    dom.addEventListener("click", onClick);
+    dom.addEventListener("mousedown", onMouseDown);
+    dom.addEventListener("contextmenu", onContextMenu);
     document.addEventListener("pointerlockchange", onLockChange);
     document.addEventListener("mousemove", onMouseMove);
     dom.addEventListener("wheel", onWheel, { passive: false });
     return () => {
-      dom.removeEventListener("click", onClick);
+      dom.removeEventListener("mousedown", onMouseDown);
+      dom.removeEventListener("contextmenu", onContextMenu);
       document.removeEventListener("pointerlockchange", onLockChange);
       document.removeEventListener("mousemove", onMouseMove);
       dom.removeEventListener("wheel", onWheel);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function startTransform(tool: TransformTool) {
+    const targetId = selectedObjectIdRef.current;
+    if (!targetId) return;
+    const original = getSelectedTransformConfig();
+    if (!original) return;
+    // Need current mouse position. We don't have it cached — capture next move,
+    // but for axis lock & immediate feedback start at (0,0) and treat as relative.
+    transformRef.current = {
+      active: true,
+      tool,
+      axis: null,
+      startMouseX: lastMouseRef.current.x,
+      startMouseY: lastMouseRef.current.y,
+      targetId,
+      original: {
+        position: { ...original.position },
+        rotation: { ...original.rotation },
+        scale: { ...original.scale },
+      },
+    };
+    updateHud();
+    setStatusMsg(
+      `${tool.toUpperCase()}: move mouse · X/Y/Z lock axis · LMB/Enter confirm · RMB/Esc cancel`,
+    );
+  }
+
+  function updateHud() {
+    const tr = transformRef.current;
+    if (!tr.active) {
+      setTransformHud("");
+      return;
+    }
+    const obj = getSelectedObject3D();
+    if (!obj) return;
+    const t = readTransformFromObject(obj);
+    const axis = tr.axis ? ` (${tr.axis.toUpperCase()})` : "";
+    let body = "";
+    if (tr.tool === "translate") {
+      body = `pos ${fmt(t.position.x)}, ${fmt(t.position.y)}, ${fmt(t.position.z)}`;
+    } else if (tr.tool === "rotate") {
+      body = `rot ${fmt(t.rotation.x)}°, ${fmt(t.rotation.y)}°, ${fmt(t.rotation.z)}°`;
+    } else {
+      body = `scale ${fmt(t.scale.x)}, ${fmt(t.scale.y)}, ${fmt(t.scale.z)}`;
+    }
+    setTransformHud(`${tr.tool.toUpperCase()}${axis} — ${body}`);
+  }
+
+  function fmt(n: number) {
+    return n.toFixed(2);
+  }
+
+  function readTransformFromObject(obj: THREE.Object3D): Transform {
+    return {
+      position: { x: obj.position.x, y: obj.position.y, z: obj.position.z },
+      rotation: {
+        x: THREE.MathUtils.radToDeg(obj.rotation.x),
+        y: THREE.MathUtils.radToDeg(obj.rotation.y),
+        z: THREE.MathUtils.radToDeg(obj.rotation.z),
+      },
+      scale: { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z },
+    };
+  }
+
+  function updateTransformGesture(mouseX: number, mouseY: number) {
+    const tr = transformRef.current;
+    if (!tr.active) return;
+    const obj = getSelectedObject3D();
+    if (!obj) return;
+    const dx = mouseX - tr.startMouseX;
+    const dy = mouseY - tr.startMouseY;
+    // Reset to original each frame, then apply delta from there
+    const t: Transform = {
+      position: { ...tr.original.position },
+      rotation: { ...tr.original.rotation },
+      scale: { ...tr.original.scale },
+    };
+    if (tr.tool === "translate") {
+      const speed = 0.02;
+      if (tr.axis === "x") {
+        t.position.x = tr.original.position.x + dx * speed;
+      } else if (tr.axis === "y") {
+        t.position.y = tr.original.position.y - dy * speed;
+      } else if (tr.axis === "z") {
+        t.position.z = tr.original.position.z + dx * speed;
+      } else {
+        // No axis lock: drag on the XZ plane
+        t.position.x = tr.original.position.x + dx * speed;
+        t.position.z = tr.original.position.z + dy * speed;
+      }
+    } else if (tr.tool === "rotate") {
+      const degPerPx = 0.5;
+      const v = dx * degPerPx;
+      if (tr.axis === "x") t.rotation.x = tr.original.rotation.x + v;
+      else if (tr.axis === "y") t.rotation.y = tr.original.rotation.y + v;
+      else if (tr.axis === "z") t.rotation.z = tr.original.rotation.z + v;
+      else t.rotation.y = tr.original.rotation.y + v; // default Y
+    } else {
+      const factor = 1 + dx * 0.005;
+      const safe = Math.max(0.01, factor);
+      if (!tr.axis) {
+        t.scale.x = tr.original.scale.x * safe;
+        t.scale.y = tr.original.scale.y * safe;
+        t.scale.z = tr.original.scale.z * safe;
+      } else if (tr.axis === "x") t.scale.x = tr.original.scale.x * safe;
+      else if (tr.axis === "y") t.scale.y = tr.original.scale.y * safe;
+      else if (tr.axis === "z") t.scale.z = tr.original.scale.z * safe;
+    }
+    applyTransformToObject(obj, t);
+    updateHud();
+  }
+
+  function commitTransform() {
+    const tr = transformRef.current;
+    if (!tr.active) return;
+    const obj = getSelectedObject3D();
+    if (!obj) {
+      tr.active = false;
+      setTransformHud("");
+      return;
+    }
+    const finalT = readTransformFromObject(obj);
+    const targetId = tr.targetId;
+    tr.active = false;
+    setTransformHud("");
+    if (targetId === "scene") {
+      setConfig((c) => ({ ...c, glbTransform: finalT }));
+    } else if (targetId) {
+      setConfig((c) => ({
+        ...c,
+        objects: c.objects.map((o) =>
+          o.id === targetId ? { ...o, transform: finalT } : o,
+        ),
+      }));
+    }
+    setStatusMsg("Transform applied.");
+  }
+
+  function cancelTransform() {
+    const tr = transformRef.current;
+    if (!tr.active) return;
+    const obj = getSelectedObject3D();
+    if (obj) applyTransformToObject(obj, tr.original);
+    tr.active = false;
+    setTransformHud("");
+    setStatusMsg("Transform cancelled.");
+  }
+
+  function objectName(id: string): string {
+    const o = config.objects.find((x) => x.id === id);
+    return o ? o.name : id;
+  }
+
+  function raycastObjects(e: MouseEvent): SelectionId {
+    const renderer = rendererRef.current;
+    const cam = cameraRef.current;
+    if (!renderer || !cam) return null;
+    const dom = renderer.domElement;
+    const rect = dom.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(ndc, cam);
+    const targets: THREE.Object3D[] = [];
+    for (const obj of objectsMapRef.current.values()) targets.push(obj);
+    if (targets.length === 0) return null;
+    const hits = raycaster.intersectObjects(targets, true);
+    if (!hits.length) return null;
+    // Walk up to find which object root this is
+    let node: THREE.Object3D | null = hits[0].object;
+    while (node) {
+      const id = node.userData?.objectId as string | undefined;
+      if (id) return id;
+      node = node.parent;
+    }
+    return null;
+  }
 
   // ---------- Playback (spline traversal) ----------
   function updatePlayback() {
@@ -754,6 +1177,62 @@ export default function App() {
     setStatusMsg("Panorama image loaded.");
   }
 
+  function onObjectUpload(file: File) {
+    const url = URL.createObjectURL(file);
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `obj_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const baseName = file.name.replace(/\.(glb|gltf)$/i, "");
+    const newObj: SceneObject = {
+      id,
+      name: baseName || "Object",
+      url,
+      transform: {
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    };
+    setConfig((c) => ({ ...c, objects: [...c.objects, newObj] }));
+    setSelectedObjectId(id);
+    setStatusMsg(`Imported "${newObj.name}".`);
+  }
+
+  function removeObject(id: string) {
+    setConfig((c) => ({ ...c, objects: c.objects.filter((o) => o.id !== id) }));
+    if (selectedObjectId === id) setSelectedObjectId(null);
+  }
+
+  function renameObject(id: string, name: string) {
+    setConfig((c) => ({
+      ...c,
+      objects: c.objects.map((o) => (o.id === id ? { ...o, name } : o)),
+    }));
+  }
+
+  function updateObjectTransform(id: SelectionId, t: Transform) {
+    if (id === "scene") {
+      setConfig((c) => ({ ...c, glbTransform: t }));
+    } else if (id) {
+      setConfig((c) => ({
+        ...c,
+        objects: c.objects.map((o) =>
+          o.id === id ? { ...o, transform: t } : o,
+        ),
+      }));
+    }
+  }
+
+  function resetObjectTransform(id: SelectionId) {
+    const reset: Transform = {
+      position: { x: 0, y: 0, z: 0 },
+      rotation: { x: 0, y: 0, z: 0 },
+      scale: { x: 1, y: 1, z: 1 },
+    };
+    updateObjectTransform(id, reset);
+  }
+
   function exportConfig() {
     // Strip blob: URLs since they aren't portable
     const cleaned: Config = {
@@ -768,6 +1247,10 @@ export default function App() {
           },
         ]),
       ),
+      objects: config.objects.map((o) => ({
+        ...o,
+        url: o.url.startsWith("blob:") ? "" : o.url,
+      })),
     };
     const blob = new Blob([JSON.stringify(cleaned, null, 2)], {
       type: "application/json",
@@ -1347,6 +1830,14 @@ export default function App() {
               importConfig={importConfig}
               mode={mode}
               setMode={setMode}
+              selectedObjectId={selectedObjectId}
+              setSelectedObjectId={setSelectedObjectId}
+              onObjectUpload={onObjectUpload}
+              removeObject={removeObject}
+              renameObject={renameObject}
+              updateObjectTransform={updateObjectTransform}
+              resetObjectTransform={resetObjectTransform}
+              setConfig={setConfig}
             />
           )}
 
@@ -1404,6 +1895,28 @@ export default function App() {
         </div>
       )}
 
+      {/* Transform HUD */}
+      {transformHud && (
+        <div
+          style={{
+            position: "absolute",
+            top: 70,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(37,99,235,0.95)",
+            color: "#fff",
+            padding: "6px 12px",
+            borderRadius: 4,
+            fontSize: 12,
+            fontFamily: "monospace",
+            pointerEvents: "none",
+            zIndex: 10,
+          }}
+        >
+          {transformHud}
+        </div>
+      )}
+
       {/* Center crosshair in path-edit mode */}
       {(mode === "admin-free" || mode === "admin-path-edit") && (
         <div
@@ -1451,6 +1964,14 @@ function AdminPanel(props: {
   importConfig: (f: File) => void;
   mode: AppMode;
   setMode: (m: AppMode) => void;
+  selectedObjectId: SelectionId;
+  setSelectedObjectId: (id: SelectionId) => void;
+  onObjectUpload: (f: File) => void;
+  removeObject: (id: string) => void;
+  renameObject: (id: string, name: string) => void;
+  updateObjectTransform: (id: SelectionId, t: Transform) => void;
+  resetObjectTransform: (id: SelectionId) => void;
+  setConfig: React.Dispatch<React.SetStateAction<Config>>;
 }) {
   const {
     config,
@@ -1478,9 +1999,23 @@ function AdminPanel(props: {
     importConfig,
     mode,
     setMode,
+    selectedObjectId,
+    setSelectedObjectId,
+    onObjectUpload,
+    removeObject,
+    renameObject,
+    updateObjectTransform,
+    resetObjectTransform,
+    setConfig,
   } = props;
 
   const shelfList = Object.values(config.shelves);
+  const selectedTransform: Transform | null =
+    selectedObjectId === "scene"
+      ? config.glbTransform
+      : selectedObjectId
+        ? config.objects.find((o) => o.id === selectedObjectId)?.transform ?? null
+        : null;
 
   return (
     <div className="col">
@@ -1515,6 +2050,103 @@ function AdminPanel(props: {
         <span className="muted" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {config.glbUrl ? "Loaded" : "No model"}
         </span>
+      </div>
+
+      <div className="divider" />
+
+      <h4>Scene Objects</h4>
+      <div className="col" style={{ gap: 4 }}>
+        {config.glbUrl && (
+          <button
+            onClick={() =>
+              setSelectedObjectId(selectedObjectId === "scene" ? null : "scene")
+            }
+            style={{
+              textAlign: "left",
+              background: selectedObjectId === "scene" ? "#2563eb" : undefined,
+              borderColor: selectedObjectId === "scene" ? "#2563eb" : undefined,
+            }}
+          >
+            🏢 Warehouse Scene
+          </button>
+        )}
+        {config.objects.map((o) => (
+          <div key={o.id} className="row" style={{ gap: 4 }}>
+            <button
+              onClick={() =>
+                setSelectedObjectId(selectedObjectId === o.id ? null : o.id)
+              }
+              style={{
+                flex: 1,
+                textAlign: "left",
+                background: selectedObjectId === o.id ? "#2563eb" : undefined,
+                borderColor: selectedObjectId === o.id ? "#2563eb" : undefined,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+              title={o.name}
+            >
+              📦 {o.name}
+            </button>
+            <button
+              className="danger"
+              onClick={() => removeObject(o.id)}
+              title="Remove"
+              style={{ padding: "4px 8px" }}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+        <label
+          style={{
+            display: "inline-block",
+            background: "#2a3038",
+            border: "1px solid #3a414b",
+            padding: "6px 10px",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 12,
+            textTransform: "none",
+            letterSpacing: 0,
+            fontWeight: 500,
+            textAlign: "center",
+          }}
+        >
+          + Import Object (.glb)
+          <input
+            type="file"
+            accept=".glb,.gltf"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onObjectUpload(f);
+              e.target.value = "";
+            }}
+          />
+        </label>
+        {selectedObjectId && selectedTransform && (
+          <TransformEditor
+            label={
+              selectedObjectId === "scene"
+                ? "Warehouse Scene"
+                : config.objects.find((o) => o.id === selectedObjectId)?.name ?? ""
+            }
+            transform={selectedTransform}
+            onChange={(t) => updateObjectTransform(selectedObjectId, t)}
+            onReset={() => resetObjectTransform(selectedObjectId)}
+            onRename={
+              selectedObjectId !== "scene"
+                ? (name) => renameObject(selectedObjectId, name)
+                : undefined
+            }
+          />
+        )}
+        <div className="muted" style={{ fontSize: 10, lineHeight: 1.5 }}>
+          Click an object in 3D to select · G/R/S = move/rotate/scale ·
+          X/Y/Z = lock axis · LMB confirm · RMB or Esc cancel
+        </div>
       </div>
 
       <div className="divider" />
@@ -1743,6 +2375,91 @@ function AdminPanel(props: {
 }
 
 // ---------------- Runtime panel ----------------
+function TransformEditor(props: {
+  label: string;
+  transform: Transform;
+  onChange: (t: Transform) => void;
+  onReset: () => void;
+  onRename?: (name: string) => void;
+}) {
+  const { label, transform, onChange, onReset, onRename } = props;
+  const num = (v: string) => {
+    const n = parseFloat(v);
+    return isNaN(n) ? 0 : n;
+  };
+  const Field = (props: {
+    val: number;
+    onSet: (n: number) => void;
+    step?: number;
+  }) => (
+    <input
+      type="number"
+      step={props.step ?? 0.1}
+      value={Number(props.val.toFixed(3))}
+      onChange={(e) => props.onSet(num(e.target.value))}
+      style={{ width: "100%", fontSize: 11, padding: "2px 4px" }}
+    />
+  );
+  return (
+    <div
+      style={{
+        background: "#1a1f27",
+        border: "1px solid #2a3038",
+        borderRadius: 4,
+        padding: 8,
+        marginTop: 6,
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      {onRename ? (
+        <input
+          value={label}
+          onChange={(e) => onRename(e.target.value)}
+          style={{ fontSize: 12, fontWeight: 600 }}
+        />
+      ) : (
+        <div style={{ fontSize: 12, fontWeight: 600 }}>{label}</div>
+      )}
+      {(["position", "rotation", "scale"] as const).map((key) => (
+        <div key={key}>
+          <div className="muted" style={{ fontSize: 10, marginBottom: 2 }}>
+            {key}
+            {key === "rotation" ? " (deg)" : ""}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
+            <Field
+              val={transform[key].x}
+              step={key === "scale" ? 0.05 : key === "rotation" ? 1 : 0.1}
+              onSet={(n) =>
+                onChange({ ...transform, [key]: { ...transform[key], x: n } })
+              }
+            />
+            <Field
+              val={transform[key].y}
+              step={key === "scale" ? 0.05 : key === "rotation" ? 1 : 0.1}
+              onSet={(n) =>
+                onChange({ ...transform, [key]: { ...transform[key], y: n } })
+              }
+            />
+            <Field
+              val={transform[key].z}
+              step={key === "scale" ? 0.05 : key === "rotation" ? 1 : 0.1}
+              onSet={(n) =>
+                onChange({ ...transform, [key]: { ...transform[key], z: n } })
+              }
+            />
+          </div>
+        </div>
+      ))}
+      <button onClick={onReset} style={{ fontSize: 11 }}>
+        Reset Transform
+      </button>
+    </div>
+  );
+}
+
 function RuntimePanel(props: {
   query: string;
   setQuery: (s: string) => void;
