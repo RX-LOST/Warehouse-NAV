@@ -835,6 +835,15 @@ export default function App() {
     const shelf = activeShelfId ? config.shelves[activeShelfId] : null;
     const wasPano =
       modeRef.current === "panorama" || modeRef.current === "admin-pano-edit";
+    const cam = cameraRef.current;
+    const atHome =
+      !!cam &&
+      cam.position.distanceTo(fromV3(config.homePosition)) < 0.1 &&
+      !wasPano;
+    if (atHome) {
+      setStatusMsg("Already at home.");
+      return;
+    }
     if (wasPano) {
       // Fade out panorama, then exit & glide home
       runFade(() => {
@@ -925,22 +934,51 @@ export default function App() {
     scene.add(sphere);
     panoSphereRef.current = sphere;
 
-    // Marker sprite
+    // Marker sprite — map-pin shape (teardrop with circle)
     const markerCanvas = document.createElement("canvas");
-    markerCanvas.width = 64;
-    markerCanvas.height = 64;
+    markerCanvas.width = 128;
+    markerCanvas.height = 192;
     const ctx = markerCanvas.getContext("2d")!;
-    const grad = ctx.createRadialGradient(32, 32, 4, 32, 32, 30);
-    grad.addColorStop(0, "rgba(239,68,68,1)");
-    grad.addColorStop(0.4, "rgba(239,68,68,0.9)");
-    grad.addColorStop(1, "rgba(239,68,68,0)");
+    // Drop shadow
+    ctx.shadowColor = "rgba(0,0,0,0.45)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 4;
+    // Pin body (teardrop)
+    ctx.beginPath();
+    const cx = 64;
+    const headY = 64;
+    const headR = 44;
+    ctx.moveTo(cx, 180); // tip
+    ctx.bezierCurveTo(cx + 38, 128, cx + headR, headY + 24, cx + headR, headY);
+    ctx.arc(cx, headY, headR, 0, Math.PI, true);
+    ctx.bezierCurveTo(cx - headR, headY + 24, cx - 38, 128, cx, 180);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 20, 0, 180);
+    grad.addColorStop(0, "#f87171");
+    grad.addColorStop(1, "#b91c1c");
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 64, 64);
+    ctx.fill();
+    // Outline
+    ctx.shadowColor = "transparent";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "#7f1d1d";
+    ctx.stroke();
+    // Inner white circle
+    ctx.beginPath();
+    ctx.arc(cx, headY, 18, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#7f1d1d";
+    ctx.stroke();
     const mTex = new THREE.CanvasTexture(markerCanvas);
+    mTex.colorSpace = THREE.SRGBColorSpace;
     const sprite = new THREE.Sprite(
-      new THREE.SpriteMaterial({ map: mTex, depthTest: false, depthWrite: false }),
+      new THREE.SpriteMaterial({ map: mTex, depthTest: false, depthWrite: false, transparent: true }),
     );
-    sprite.scale.set(20, 20, 1);
+    // Anchor sprite at the tip (bottom-center) so the pin "points" at the marker location
+    sprite.center.set(0.5, 0);
+    sprite.scale.set(40, 60, 1);
     sprite.visible = false;
     scene.add(sprite);
     panoMarkerRef.current = sprite;
@@ -1006,9 +1044,8 @@ export default function App() {
     let ly = 0;
 
     const onDown = (e: MouseEvent) => {
-      // Click-to-place marker in pano editor mode (with Shift held = drag, otherwise place if alt)
-      if (modeRef.current === "admin-pano-edit" && e.button === 0 && !e.shiftKey) {
-        // Determine: click places marker, shift-drag rotates
+      // Pano editor: Shift+click places marker, plain drag rotates
+      if (modeRef.current === "admin-pano-edit" && e.button === 0 && e.shiftKey) {
         placeMarkerAtScreen(e);
         return;
       }
@@ -1220,7 +1257,7 @@ export default function App() {
           pointerEvents: showPano ? "auto" : "none",
           zIndex: showPano ? 1 : 0,
           display: "block",
-          cursor: mode === "admin-pano-edit" ? "crosshair" : "grab",
+          cursor: mode === "admin-pano-edit" ? "grab" : "grab",
         }}
       />
 
@@ -1334,7 +1371,7 @@ export default function App() {
             </div>
           ) : mode === "admin-pano-edit" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
-              Click = place marker · Shift+Drag = rotate view · Wheel = zoom
+              Drag = rotate view · Shift+Click = place marker · Wheel = zoom
             </div>
           ) : mode === "panorama" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
