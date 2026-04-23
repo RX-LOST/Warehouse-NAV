@@ -731,8 +731,10 @@ export default function App() {
   function startTransform(tool: TransformTool) {
     const targetId = selectedObjectIdRef.current;
     if (!targetId) return;
-    const original = getSelectedTransformConfig();
-    if (!original) return;
+    // Read original from the live Object3D so consecutive transforms compose
+    const obj = getSelectedObject3D();
+    if (!obj) return;
+    const original = readTransformFromObject(obj);
     // Reset virtual cursor to physical cursor location, then lock pointer for edge wrap
     virtualMouseRef.current.x = lastMouseRef.current.x;
     virtualMouseRef.current.y = lastMouseRef.current.y;
@@ -1793,7 +1795,7 @@ export default function App() {
           zIndex: 10,
         }}
       >
-        <div className="panel" style={{ pointerEvents: "auto", minWidth: 280 }}>
+        <div className="panel" style={{ pointerEvents: "auto", minWidth: 280, maxHeight: "calc(100vh - 100px)", overflowY: "auto" }}>
           <div
             style={{
               display: "grid",
