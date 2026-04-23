@@ -238,7 +238,6 @@ export default function App() {
       config.homePosition.y,
       config.homePosition.z,
     );
-    camera.up.set(0, 0, 1);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -269,8 +268,8 @@ export default function App() {
       const lookDir = new THREE.Vector3()
         .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
         .normalize();
-      yawRef.current = Math.atan2(-lookDir.x, -lookDir.y);
-      pitchRef.current = Math.asin(lookDir.z);
+      yawRef.current = Math.atan2(-lookDir.x, -lookDir.z);
+      pitchRef.current = Math.asin(lookDir.y);
       applyCameraRotation();
     }
 
@@ -584,20 +583,8 @@ export default function App() {
   function applyCameraRotation() {
     const cam = cameraRef.current;
     if (!cam) return;
-    const yaw = yawRef.current;
-    const pitch = pitchRef.current;
-    const cp = Math.cos(pitch);
-    const fwd = new THREE.Vector3(
-      -Math.sin(yaw) * cp,
-      -Math.cos(yaw) * cp,
-      Math.sin(pitch),
-    );
-    cam.up.set(0, 0, 1);
-    cam.lookAt(
-      cam.position.x + fwd.x,
-      cam.position.y + fwd.y,
-      cam.position.z + fwd.z,
-    );
+    const euler = new THREE.Euler(pitchRef.current, yawRef.current, 0, "YXZ");
+    cam.quaternion.setFromEuler(euler);
   }
 
   function updateCamera(dt: number) {
@@ -610,24 +597,24 @@ export default function App() {
 
     const speed = (keysRef.current["ShiftLeft"] ? 8 : 3) * dt;
 
-    // Z-up: WASD on horizontal XY plane, Q/E vertical on Z
+    // Movement vectors based on yaw only (so WASD is horizontal)
     const forward = new THREE.Vector3(
       -Math.sin(yawRef.current),
-      -Math.cos(yawRef.current),
       0,
+      -Math.cos(yawRef.current),
     );
     const right = new THREE.Vector3(
       Math.cos(yawRef.current),
-      -Math.sin(yawRef.current),
       0,
+      -Math.sin(yawRef.current),
     );
 
     if (keysRef.current["KeyW"]) cam.position.addScaledVector(forward, speed);
     if (keysRef.current["KeyS"]) cam.position.addScaledVector(forward, -speed);
     if (keysRef.current["KeyA"]) cam.position.addScaledVector(right, -speed);
     if (keysRef.current["KeyD"]) cam.position.addScaledVector(right, speed);
-    if (keysRef.current["KeyE"]) cam.position.z += speed;
-    if (keysRef.current["KeyQ"]) cam.position.z -= speed;
+    if (keysRef.current["KeyE"]) cam.position.y += speed;
+    if (keysRef.current["KeyQ"]) cam.position.y -= speed;
   }
 
   // ---------- Pointer lock for mouse look ----------
@@ -822,26 +809,30 @@ export default function App() {
       rotation: { ...tr.original.rotation },
       scale: { ...tr.original.scale },
     };
+    // Axis-key mapping: world is Y-up. The user-pressed axis key maps to:
+    //   X key -> world X (horizontal)
+    //   Y key -> world Z (horizontal depth)
+    //   Z key -> world Y (vertical / up)
     if (tr.tool === "translate") {
       const speed = 0.02;
       if (tr.axis === "x") {
         t.position.x = tr.original.position.x + dx * speed;
       } else if (tr.axis === "y") {
-        t.position.y = tr.original.position.y + dx * speed;
+        t.position.z = tr.original.position.z + dx * speed;
       } else if (tr.axis === "z") {
-        t.position.z = tr.original.position.z - dy * speed;
-      } else {
-        // No axis lock: drag on the horizontal XY plane (Z-up)
-        t.position.x = tr.original.position.x + dx * speed;
         t.position.y = tr.original.position.y - dy * speed;
+      } else {
+        // No axis lock: drag on the horizontal XZ plane
+        t.position.x = tr.original.position.x + dx * speed;
+        t.position.z = tr.original.position.z + dy * speed;
       }
     } else if (tr.tool === "rotate") {
       const degPerPx = 0.5;
       const v = dx * degPerPx;
       if (tr.axis === "x") t.rotation.x = tr.original.rotation.x + v;
-      else if (tr.axis === "y") t.rotation.y = tr.original.rotation.y + v;
-      else if (tr.axis === "z") t.rotation.z = tr.original.rotation.z + v;
-      else t.rotation.z = tr.original.rotation.z + v; // default: vertical (Z)
+      else if (tr.axis === "y") t.rotation.z = tr.original.rotation.z + v;
+      else if (tr.axis === "z") t.rotation.y = tr.original.rotation.y + v;
+      else t.rotation.y = tr.original.rotation.y + v; // default: around vertical
     } else {
       const factor = 1 + dx * 0.005;
       const safe = Math.max(0.01, factor);
@@ -850,8 +841,8 @@ export default function App() {
         t.scale.y = tr.original.scale.y * safe;
         t.scale.z = tr.original.scale.z * safe;
       } else if (tr.axis === "x") t.scale.x = tr.original.scale.x * safe;
-      else if (tr.axis === "y") t.scale.y = tr.original.scale.y * safe;
-      else if (tr.axis === "z") t.scale.z = tr.original.scale.z * safe;
+      else if (tr.axis === "y") t.scale.z = tr.original.scale.z * safe;
+      else if (tr.axis === "z") t.scale.y = tr.original.scale.y * safe;
     }
     applyTransformToObject(obj, t);
     updateHud();
@@ -1180,8 +1171,8 @@ export default function App() {
       const dir = new THREE.Vector3()
         .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
         .normalize();
-      yawRef.current = Math.atan2(-dir.x, -dir.y);
-      pitchRef.current = Math.asin(dir.z);
+      yawRef.current = Math.atan2(-dir.x, -dir.z);
+      pitchRef.current = Math.asin(dir.y);
       applyCameraRotation();
       return;
     }
