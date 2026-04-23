@@ -164,6 +164,8 @@ export default function App() {
   const pitchRef = useRef(0);
   const isPointerLockedRef = useRef(false);
   const lastMouseRef = useRef({ x: 0, y: 0 });
+  const virtualMouseRef = useRef({ x: 0, y: 0 });
+  const cameraRotateRef = useRef(false);
   const playbackRef = useRef<{
     active: boolean;
     curve: THREE.CatmullRomCurve3 | null;
@@ -236,6 +238,7 @@ export default function App() {
       config.homePosition.y,
       config.homePosition.z,
     );
+    camera.up.set(0, 0, 1);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -266,8 +269,8 @@ export default function App() {
       const lookDir = new THREE.Vector3()
         .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
         .normalize();
-      yawRef.current = Math.atan2(-lookDir.x, -lookDir.z);
-      pitchRef.current = Math.asin(lookDir.y);
+      yawRef.current = Math.atan2(-lookDir.x, -lookDir.y);
+      pitchRef.current = Math.asin(lookDir.z);
       applyCameraRotation();
     }
 
@@ -581,8 +584,20 @@ export default function App() {
   function applyCameraRotation() {
     const cam = cameraRef.current;
     if (!cam) return;
-    const euler = new THREE.Euler(pitchRef.current, yawRef.current, 0, "YXZ");
-    cam.quaternion.setFromEuler(euler);
+    const yaw = yawRef.current;
+    const pitch = pitchRef.current;
+    const cp = Math.cos(pitch);
+    const fwd = new THREE.Vector3(
+      -Math.sin(yaw) * cp,
+      -Math.cos(yaw) * cp,
+      Math.sin(pitch),
+    );
+    cam.up.set(0, 0, 1);
+    cam.lookAt(
+      cam.position.x + fwd.x,
+      cam.position.y + fwd.y,
+      cam.position.z + fwd.z,
+    );
   }
 
   function updateCamera(dt: number) {
@@ -595,24 +610,24 @@ export default function App() {
 
     const speed = (keysRef.current["ShiftLeft"] ? 8 : 3) * dt;
 
-    // Movement vectors based on yaw only (so WASD is horizontal)
+    // Z-up: WASD on horizontal XY plane, Q/E vertical on Z
     const forward = new THREE.Vector3(
       -Math.sin(yawRef.current),
-      0,
       -Math.cos(yawRef.current),
+      0,
     );
     const right = new THREE.Vector3(
       Math.cos(yawRef.current),
-      0,
       -Math.sin(yawRef.current),
+      0,
     );
 
     if (keysRef.current["KeyW"]) cam.position.addScaledVector(forward, speed);
     if (keysRef.current["KeyS"]) cam.position.addScaledVector(forward, -speed);
     if (keysRef.current["KeyA"]) cam.position.addScaledVector(right, -speed);
     if (keysRef.current["KeyD"]) cam.position.addScaledVector(right, speed);
-    if (keysRef.current["KeyE"]) cam.position.y += speed;
-    if (keysRef.current["KeyQ"]) cam.position.y -= speed;
+    if (keysRef.current["KeyE"]) cam.position.z += speed;
+    if (keysRef.current["KeyQ"]) cam.position.z -= speed;
   }
 
   // ---------- Pointer lock for mouse look ----------
@@ -630,13 +645,15 @@ export default function App() {
         else if (e.button === 2) cancelTransform();
         return;
       }
-      if (e.button !== 0) return;
-      // If pointer-locked, click releases lock
-      if (isPointerLockedRef.current) {
-        document.exitPointerLock();
+      // Right-button drag: rotate camera with edge wrap (via pointer lock)
+      if (e.button === 2) {
+        e.preventDefault();
+        cameraRotateRef.current = true;
+        dom.requestPointerLock();
         return;
       }
-      // Try selection raycast against scene objects
+      if (e.button !== 0) return;
+      // Left-click: try selection raycast against scene objects
       const hit = raycastObjects(e);
       if (hit) {
         setSelectedObjectId(hit);
@@ -645,30 +662,38 @@ export default function App() {
         );
         return;
       }
-      // Empty space: clear selection if anything selected, otherwise lock pointer
+      // Empty space: clear selection
       if (selectedObjectIdRef.current) {
         setSelectedObjectId(null);
-      } else {
-        dom.requestPointerLock();
+      }
+    };
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button === 2 && cameraRotateRef.current) {
+        cameraRotateRef.current = false;
+        if (document.pointerLockElement === dom) document.exitPointerLock();
       }
     };
     const onContextMenu = (e: MouseEvent) => {
-      // Block right-click menu while in admin so RMB can cancel transforms
-      if (
-        modeRef.current === "admin-free" ||
-        modeRef.current === "admin-path-edit"
-      ) {
-        e.preventDefault();
-      }
+      // Always block native right-click menu over the canvas so RMB can drive camera/cancel
+      e.preventDefault();
     };
     const onLockChange = () => {
       isPointerLockedRef.current = document.pointerLockElement === dom;
+      // If lock was lost externally (Esc), clean up state
+      if (!isPointerLockedRef.current) {
+        if (cameraRotateRef.current) cameraRotateRef.current = false;
+      }
     };
     const onMouseMove = (e: MouseEvent) => {
-      lastMouseRef.current.x = e.clientX;
-      lastMouseRef.current.y = e.clientY;
-      // Pointer-lock free-fly look
-      if (isPointerLockedRef.current) {
+      // Always track real cursor position when not locked
+      if (!isPointerLockedRef.current) {
+        lastMouseRef.current.x = e.clientX;
+        lastMouseRef.current.y = e.clientY;
+        virtualMouseRef.current.x = e.clientX;
+        virtualMouseRef.current.y = e.clientY;
+      }
+      // Camera rotate via right-mouse drag (pointer-locked for edge wrap)
+      if (cameraRotateRef.current && isPointerLockedRef.current) {
         yawRef.current -= e.movementX * 0.0025;
         pitchRef.current -= e.movementY * 0.0025;
         pitchRef.current = Math.max(
@@ -678,9 +703,16 @@ export default function App() {
         applyCameraRotation();
         return;
       }
-      // Transform gesture
+      // Transform gesture: accumulate movement into virtual cursor
       if (transformRef.current.active) {
-        updateTransformGesture(e.clientX, e.clientY);
+        if (isPointerLockedRef.current) {
+          virtualMouseRef.current.x += e.movementX;
+          virtualMouseRef.current.y += e.movementY;
+        }
+        updateTransformGesture(
+          virtualMouseRef.current.x,
+          virtualMouseRef.current.y,
+        );
       }
     };
     const onWheel = (e: WheelEvent) => {
@@ -693,12 +725,14 @@ export default function App() {
       cam.updateProjectionMatrix();
     };
     dom.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("mouseup", onMouseUp);
     dom.addEventListener("contextmenu", onContextMenu);
     document.addEventListener("pointerlockchange", onLockChange);
     document.addEventListener("mousemove", onMouseMove);
     dom.addEventListener("wheel", onWheel, { passive: false });
     return () => {
       dom.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("mouseup", onMouseUp);
       dom.removeEventListener("contextmenu", onContextMenu);
       document.removeEventListener("pointerlockchange", onLockChange);
       document.removeEventListener("mousemove", onMouseMove);
@@ -712,14 +746,15 @@ export default function App() {
     if (!targetId) return;
     const original = getSelectedTransformConfig();
     if (!original) return;
-    // Need current mouse position. We don't have it cached — capture next move,
-    // but for axis lock & immediate feedback start at (0,0) and treat as relative.
+    // Reset virtual cursor to physical cursor location, then lock pointer for edge wrap
+    virtualMouseRef.current.x = lastMouseRef.current.x;
+    virtualMouseRef.current.y = lastMouseRef.current.y;
     transformRef.current = {
       active: true,
       tool,
       axis: null,
-      startMouseX: lastMouseRef.current.x,
-      startMouseY: lastMouseRef.current.y,
+      startMouseX: virtualMouseRef.current.x,
+      startMouseY: virtualMouseRef.current.y,
       targetId,
       original: {
         position: { ...original.position },
@@ -727,6 +762,10 @@ export default function App() {
         scale: { ...original.scale },
       },
     };
+    const dom = rendererRef.current?.domElement;
+    if (dom && document.pointerLockElement !== dom) {
+      dom.requestPointerLock();
+    }
     updateHud();
     setStatusMsg(
       `${tool.toUpperCase()}: move mouse · X/Y/Z lock axis · LMB/Enter confirm · RMB/Esc cancel`,
@@ -788,13 +827,13 @@ export default function App() {
       if (tr.axis === "x") {
         t.position.x = tr.original.position.x + dx * speed;
       } else if (tr.axis === "y") {
-        t.position.y = tr.original.position.y - dy * speed;
+        t.position.y = tr.original.position.y + dx * speed;
       } else if (tr.axis === "z") {
-        t.position.z = tr.original.position.z + dx * speed;
+        t.position.z = tr.original.position.z - dy * speed;
       } else {
-        // No axis lock: drag on the XZ plane
+        // No axis lock: drag on the horizontal XY plane (Z-up)
         t.position.x = tr.original.position.x + dx * speed;
-        t.position.z = tr.original.position.z + dy * speed;
+        t.position.y = tr.original.position.y - dy * speed;
       }
     } else if (tr.tool === "rotate") {
       const degPerPx = 0.5;
@@ -802,7 +841,7 @@ export default function App() {
       if (tr.axis === "x") t.rotation.x = tr.original.rotation.x + v;
       else if (tr.axis === "y") t.rotation.y = tr.original.rotation.y + v;
       else if (tr.axis === "z") t.rotation.z = tr.original.rotation.z + v;
-      else t.rotation.y = tr.original.rotation.y + v; // default Y
+      else t.rotation.z = tr.original.rotation.z + v; // default: vertical (Z)
     } else {
       const factor = 1 + dx * 0.005;
       const safe = Math.max(0.01, factor);
@@ -821,6 +860,8 @@ export default function App() {
   function commitTransform() {
     const tr = transformRef.current;
     if (!tr.active) return;
+    const dom = rendererRef.current?.domElement;
+    if (dom && document.pointerLockElement === dom) document.exitPointerLock();
     const obj = getSelectedObject3D();
     if (!obj) {
       tr.active = false;
@@ -847,6 +888,8 @@ export default function App() {
   function cancelTransform() {
     const tr = transformRef.current;
     if (!tr.active) return;
+    const dom = rendererRef.current?.domElement;
+    if (dom && document.pointerLockElement === dom) document.exitPointerLock();
     const obj = getSelectedObject3D();
     if (obj) applyTransformToObject(obj, tr.original);
     tr.active = false;
@@ -1137,8 +1180,8 @@ export default function App() {
       const dir = new THREE.Vector3()
         .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
         .normalize();
-      yawRef.current = Math.atan2(-dir.x, -dir.z);
-      pitchRef.current = Math.asin(dir.y);
+      yawRef.current = Math.atan2(-dir.x, -dir.y);
+      pitchRef.current = Math.asin(dir.z);
       applyCameraRotation();
       return;
     }
@@ -1857,8 +1900,8 @@ export default function App() {
           <h3>Controls</h3>
           {mode === "admin-free" || mode === "admin-path-edit" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
-              Click viewport to capture mouse · WASD = move · Q/E = down/up ·
-              Shift = sprint · Mouse = look · Wheel = FOV · Esc = release
+              Right-click drag = look (mouse wraps at edges) · WASD = move ·
+              Q/E = down/up · Shift = sprint · Wheel = FOV · Left-click = select
             </div>
           ) : mode === "admin-pano-edit" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
