@@ -8,6 +8,7 @@ type Shelf = {
   id: string;
   barcode: string;
   waypoints: Vec3[];
+  waypointLookAts: (Vec3 | null)[]; // per-waypoint camera look target (independent rotation)
   lookAt: Vec3 | null;
   panoramaUrl: string | null;
   panoramaYaw: number;
@@ -89,14 +90,21 @@ function loadConfig(): Config {
       const merged = { ...defaultConfig, ...parsed };
       // Backfill new shelf fields for older saved configs
       merged.shelves = Object.fromEntries(
-        Object.entries(merged.shelves || {}).map(([k, s]) => [
-          k,
-          {
-            durationSec: 4,
-            tension: 0.5,
-            ...(s as Partial<Shelf>),
-          } as Shelf,
-        ]),
+        Object.entries(merged.shelves || {}).map(([k, s]) => {
+          const shelf = s as Partial<Shelf> & { waypoints?: Vec3[] };
+          const wps = shelf.waypoints ?? [];
+          return [
+            k,
+            {
+              durationSec: 4,
+              tension: 0.5,
+              ...shelf,
+              waypointLookAts: Array.isArray(shelf.waypointLookAts) && shelf.waypointLookAts.length === wps.length
+                ? shelf.waypointLookAts
+                : new Array(wps.length).fill(null),
+            } as Shelf,
+          ];
+        }),
       );
       if (!merged.glbTransform) merged.glbTransform = identityTransform();
       if (!Array.isArray(merged.objects)) merged.objects = [];
@@ -147,6 +155,13 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [serverConfigs, setServerConfigs] = useState<string[]>([]);
   const [serverConfigName, setServerConfigName] = useState("default");
+  const [adminToken, setAdminToken] = useState<string | null>(() => sessionStorage.getItem("admin-token"));
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+  const [isRightDragging, setIsRightDragging] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [newPasswordInput, setNewPasswordInput] = useState("");
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -194,6 +209,8 @@ export default function App() {
     startTime: number;
     startQuat: THREE.Quaternion;
     endLookAt: THREE.Vector3 | null;
+    waypointPositions: Vec3[];
+    waypointLookAts: (Vec3 | null)[];
     onComplete: (() => void) | null;
     reverse: boolean;
   }>({
@@ -203,6 +220,8 @@ export default function App() {
     startTime: 0,
     startQuat: new THREE.Quaternion(),
     endLookAt: null,
+    waypointPositions: [],
+    waypointLookAts: [],
     onComplete: null,
     reverse: false,
   });
@@ -671,6 +690,7 @@ export default function App() {
       if (e.button === 2) {
         e.preventDefault();
         cameraRotateRef.current = true;
+        setIsRightDragging(true);
         dom.requestPointerLock();
         return;
       }
@@ -692,6 +712,7 @@ export default function App() {
     const onMouseUp = (e: MouseEvent) => {
       if (e.button === 2 && cameraRotateRef.current) {
         cameraRotateRef.current = false;
+        setIsRightDragging(false);
         if (document.pointerLockElement === dom) document.exitPointerLock();
       }
     };
@@ -965,55 +986,68 @@ export default function App() {
     const t = Math.min(1, (performance.now() - pb.startTime) / pb.duration);
     const eased = easeInOutCubic(t);
     const u = pb.reverse ? 1 - eased : eased;
+
+    // --- Position: follow spline ---
     const pos = pb.curve.getPoint(u);
     cam.position.copy(pos);
 
-    // Compute path-look quaternion (looking along the spline tangent)
-    const tangent = pb.curve.getTangent(u).normalize();
-    if (pb.reverse) tangent.multiplyScalar(-1);
-    const aheadPoint = pos.clone().add(tangent);
-    const pathMat = new THREE.Matrix4().lookAt(
-      pos,
-      aheadPoint,
-      new THREE.Vector3(0, 1, 0),
-    );
-    const pathQuat = new THREE.Quaternion().setFromRotationMatrix(pathMat);
+    const up = new THREE.Vector3(0, 1, 0);
+    const wps = pb.waypointPositions;
+    const wlas = pb.waypointLookAts;
+    const n = wps.length;
 
-    // Final look quaternion (toward end target if provided)
-    let endQuat: THREE.Quaternion;
-    if (pb.endLookAt) {
-      const m = new THREE.Matrix4().lookAt(
-        pos,
-        pb.endLookAt,
-        new THREE.Vector3(0, 1, 0),
-      );
-      endQuat = new THREE.Quaternion().setFromRotationMatrix(m);
-    } else {
-      endQuat = pathQuat.clone();
-    }
+    const buildQ = (i: number): THREE.Quaternion => {
+      const la = wlas[i];
+      if (la) {
+        const wpPos = fromV3(wps[i]);
+        const lookTarget = fromV3(la);
+        if (wpPos.distanceTo(lookTarget) > 0.001) {
+          const m = new THREE.Matrix4().lookAt(wpPos, lookTarget, up);
+          return new THREE.Quaternion().setFromRotationMatrix(m);
+        }
+      }
+      const tU = n <= 1 ? 0.5 : Math.max(0.001, Math.min(0.999, i / (n - 1)));
+      const tang = pb.curve!.getTangent(tU).normalize();
+      if (pb.reverse) tang.multiplyScalar(-1);
+      const m = new THREE.Matrix4().lookAt(new THREE.Vector3(), tang, up);
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    };
 
-    // Smooth easing for rotation: ease in from start orientation, ease out into final
-    // 0..0.25 -> blend startQuat -> pathQuat
-    // 0.25..0.7 -> pathQuat
-    // 0.7..1 -> blend pathQuat -> endQuat
     let q: THREE.Quaternion;
-    if (t < 0.25) {
-      const k = easeInOutCubic(t / 0.25);
-      q = pb.startQuat.clone().slerp(pathQuat, k);
-    } else if (t < 0.7) {
-      q = pathQuat;
+    if (n < 2) {
+      q = cam.quaternion.clone();
     } else {
-      const k = easeInOutCubic((t - 0.7) / 0.3);
-      q = pathQuat.clone().slerp(endQuat, k);
+      const segTotal = n - 1;
+      const rawSeg = u * segTotal;
+      const segIdx = Math.max(0, Math.min(segTotal - 1, Math.floor(rawSeg)));
+      const segT = easeInOutCubic(rawSeg - segIdx);
+      const qa = buildQ(segIdx);
+      const qb = buildQ(Math.min(n - 1, segIdx + 1));
+      q = qa.clone().slerp(qb, segT);
+
+      if (t < 0.08) {
+        const k = easeInOutCubic(t / 0.08);
+        q = pb.startQuat.clone().slerp(q, k);
+      }
     }
+
+    if (pb.endLookAt && u > 0.85) {
+      const k = easeInOutCubic((u - 0.85) / 0.15);
+      const endM = new THREE.Matrix4().lookAt(pos, pb.endLookAt, up);
+      const endQ = new THREE.Quaternion().setFromRotationMatrix(endM);
+      q = q.clone().slerp(endQ, k);
+    }
+
     cam.quaternion.copy(q);
 
     if (t >= 1) {
       pb.active = false;
-      cam.quaternion.copy(endQuat);
+      if (pb.endLookAt) {
+        const m = new THREE.Matrix4().lookAt(pos, pb.endLookAt, up);
+        cam.quaternion.setFromRotationMatrix(m);
+      }
       const cb = pb.onComplete;
       pb.onComplete = null;
-      // Sync yaw/pitch with current quaternion so free-fly resumes smoothly
       const e = new THREE.Euler().setFromQuaternion(cam.quaternion, "YXZ");
       yawRef.current = e.y;
       pitchRef.current = e.x;
@@ -1032,6 +1066,7 @@ export default function App() {
     reverse = false,
     durationSec?: number,
     tension?: number,
+    waypointLookAts?: (Vec3 | null)[],
   ) {
     if (waypoints.length < 2) {
       setStatusMsg("Need at least 2 waypoints for playback.");
@@ -1054,6 +1089,8 @@ export default function App() {
       startTime: performance.now(),
       startQuat: cam.quaternion.clone(),
       endLookAt: lookAt ? fromV3(lookAt) : null,
+      waypointPositions: waypoints,
+      waypointLookAts: waypointLookAts ?? new Array(waypoints.length).fill(null),
       onComplete: onDone,
       reverse,
     };
@@ -1076,6 +1113,7 @@ export default function App() {
       id,
       barcode: newShelfBarcode.trim(),
       waypoints: [],
+      waypointLookAts: [],
       lookAt: null,
       panoramaUrl: null,
       panoramaYaw: 0,
@@ -1111,6 +1149,9 @@ export default function App() {
     const cam = cameraRef.current;
     if (!cam) return;
     const wp = toV3(cam.position);
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const lookTarget = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
     setConfig((c) => {
       const shelf = c.shelves[id];
       if (!shelf) return c;
@@ -1121,6 +1162,7 @@ export default function App() {
           [id]: {
             ...shelf,
             waypoints: [...shelf.waypoints, wp],
+            waypointLookAts: [...(shelf.waypointLookAts ?? []), lookTarget],
           },
         },
       };
@@ -1142,6 +1184,7 @@ export default function App() {
           [activeShelfId]: {
             ...shelf,
             waypoints: shelf.waypoints.slice(0, -1),
+            waypointLookAts: (shelf.waypointLookAts ?? []).slice(0, -1),
           },
         },
       };
@@ -1157,10 +1200,103 @@ export default function App() {
         ...c,
         shelves: {
           ...c.shelves,
-          [activeShelfId]: { ...shelf, waypoints: [] },
+          [activeShelfId]: { ...shelf, waypoints: [], waypointLookAts: [] },
         },
       };
     });
+  }
+
+  function deleteWaypointAt(shelfId: string, index: number) {
+    setConfig((c) => {
+      const shelf = c.shelves[shelfId];
+      if (!shelf) return c;
+      return {
+        ...c,
+        shelves: {
+          ...c.shelves,
+          [shelfId]: {
+            ...shelf,
+            waypoints: shelf.waypoints.filter((_, i) => i !== index),
+            waypointLookAts: (shelf.waypointLookAts ?? []).filter((_, i) => i !== index),
+          },
+        },
+      };
+    });
+  }
+
+  function setWaypointLookAtAtIndex(shelfId: string, index: number) {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const lookTarget = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
+    setConfig((c) => {
+      const shelf = c.shelves[shelfId];
+      if (!shelf) return c;
+      const newLookAts = [...(shelf.waypointLookAts ?? new Array(shelf.waypoints.length).fill(null))];
+      newLookAts[index] = lookTarget;
+      return {
+        ...c,
+        shelves: { ...c.shelves, [shelfId]: { ...shelf, waypointLookAts: newLookAts } },
+      };
+    });
+    setStatusMsg(`Waypoint ${index + 1} look direction set.`);
+  }
+
+  function teleportToWaypoint(shelfId: string, index: number) {
+    const shelf = config.shelves[shelfId];
+    if (!shelf) return;
+    const wp = shelf.waypoints[index];
+    const la = (shelf.waypointLookAts ?? [])[index];
+    if (!wp) return;
+    const cam = cameraRef.current;
+    if (!cam) return;
+    cam.position.set(wp.x, wp.y, wp.z);
+    if (la) {
+      const dir = new THREE.Vector3().subVectors(fromV3(la), fromV3(wp)).normalize();
+      yawRef.current = Math.atan2(-dir.x, -dir.z);
+      pitchRef.current = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+    }
+    applyCameraRotation();
+    setStatusMsg(`Teleported to waypoint ${index + 1}.`);
+  }
+
+  function duplicateShelf(id: string) {
+    const shelf = config.shelves[id];
+    if (!shelf) return;
+    let newId = `${id}_copy`;
+    let attempt = 1;
+    while (config.shelves[newId]) {
+      newId = `${id}_copy${attempt++}`;
+    }
+    const copy: Shelf = {
+      ...shelf,
+      id: newId,
+      waypoints: shelf.waypoints.map((w) => ({ ...w })),
+      waypointLookAts: (shelf.waypointLookAts ?? []).map((la) => (la ? { ...la } : null)),
+    };
+    setConfig((c) => ({ ...c, shelves: { ...c.shelves, [newId]: copy } }));
+    setActiveShelfId(newId);
+    setStatusMsg(`Shelf duplicated as "${newId}".`);
+  }
+
+  function renameShelf(oldId: string, newId: string, barcode: string) {
+    newId = newId.trim();
+    barcode = barcode.trim();
+    if (!newId) { setStatusMsg("Shelf ID cannot be empty."); return; }
+    setConfig((c) => {
+      const shelf = c.shelves[oldId];
+      if (!shelf) return c;
+      const next = { ...c.shelves };
+      if (newId !== oldId) {
+        if (next[newId]) { setStatusMsg(`Shelf "${newId}" already exists.`); return c; }
+        delete next[oldId];
+      }
+      next[newId] = { ...shelf, id: newId, barcode };
+      return { ...c, shelves: next };
+    });
+    if (newId !== oldId) setActiveShelfId(newId);
+    setStatusMsg(`Shelf updated.`);
   }
 
   function setLookAtTarget() {
@@ -1311,6 +1447,65 @@ export default function App() {
       .finally(() => setUploading(false));
   }
 
+  // ---------- Auth ----------
+  async function loginAdmin() {
+    setPasswordError("");
+    try {
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: passwordInput }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPasswordError(data.error ?? "Login failed");
+        return;
+      }
+      const tok: string = data.token;
+      sessionStorage.setItem("admin-token", tok);
+      setAdminToken(tok);
+      setShowPasswordModal(false);
+      setPasswordInput("");
+      setPanel("admin");
+    } catch {
+      setPasswordError("Network error");
+    }
+  }
+
+  async function logoutAdmin() {
+    if (adminToken) {
+      fetch(`${API_BASE}/auth/logout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: adminToken }),
+      }).catch(() => {});
+    }
+    sessionStorage.removeItem("admin-token");
+    setAdminToken(null);
+    setPanel("runtime");
+  }
+
+  async function changePassword() {
+    if (!adminToken) return;
+    try {
+      const res = await fetch(`${API_BASE}/auth/change-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: adminToken, newPassword: newPasswordInput }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPasswordError(data.error ?? "Failed");
+        return;
+      }
+      setShowChangePassword(false);
+      setNewPasswordInput("");
+      setStatusMsg("Password changed successfully.");
+    } catch {
+      setPasswordError("Network error");
+    }
+  }
+
   function saveConfigToServer() {
     const name = serverConfigName.trim() || "default";
     const cleaned: Config = {
@@ -1442,6 +1637,7 @@ export default function App() {
     const fullPath: Vec3[] = [];
     fullPath.push(toV3(cameraRef.current!.position));
     fullPath.push(...match.waypoints);
+    const fullLookAts: (Vec3 | null)[] = [null, ...(match.waypointLookAts ?? new Array(match.waypoints.length).fill(null))];
     startPlayback(
       fullPath,
       match.lookAt,
@@ -1456,6 +1652,7 @@ export default function App() {
       false,
       match.durationSec,
       match.tension,
+      fullLookAts,
     );
   }
 
@@ -1495,6 +1692,11 @@ export default function App() {
       ...[...shelf.waypoints].reverse(),
       config.homePosition,
     ];
+    const reverseLookAts: (Vec3 | null)[] = [
+      null,
+      ...[...(shelf.waypointLookAts ?? new Array(shelf.waypoints.length).fill(null))].reverse(),
+      null,
+    ];
     startPlayback(
       reversePath,
       config.homeLookAt,
@@ -1505,6 +1707,7 @@ export default function App() {
       false,
       shelf.durationSec,
       shelf.tension,
+      reverseLookAts,
     );
   }
 
@@ -1924,7 +2127,17 @@ export default function App() {
           zIndex: 10,
         }}
       >
-        <div className="panel" style={{ pointerEvents: "auto", minWidth: 280, maxHeight: "calc(100vh - 100px)", overflowY: "auto" }}>
+        <div
+          className="panel"
+          style={{
+            pointerEvents: "auto",
+            minWidth: 280,
+            maxHeight: "calc(100vh - 100px)",
+            overflowY: "auto",
+            opacity: isRightDragging ? 0.08 : 1,
+            transition: "opacity 0.25s ease",
+          }}
+        >
           <div
             style={{
               display: "grid",
@@ -1951,7 +2164,15 @@ export default function App() {
               Runtime
             </button>
             <button
-              onClick={() => setPanel("admin")}
+              onClick={() => {
+                if (adminToken) {
+                  setPanel("admin");
+                } else {
+                  setPasswordError("");
+                  setPasswordInput("");
+                  setShowPasswordModal(true);
+                }
+              }}
               style={{
                 padding: "8px 12px",
                 fontSize: 13,
@@ -1961,14 +2182,14 @@ export default function App() {
                 color: panel === "admin" ? "#fff" : "#9ca3af",
               }}
             >
-              Admin
+              Admin{adminToken ? "" : " 🔒"}
             </button>
           </div>
           <div className="muted" style={{ marginBottom: 8, fontSize: 10 }}>
             Mode: <strong style={{ color: "#e6e8eb" }}>{mode}</strong>
           </div>
 
-          {panel === "admin" && (
+          {panel === "admin" && adminToken && (
             <AdminPanel
               config={config}
               activeShelf={activeShelf}
@@ -1980,9 +2201,14 @@ export default function App() {
               setNewShelfBarcode={setNewShelfBarcode}
               createShelf={createShelf}
               deleteShelf={deleteShelf}
+              duplicateShelf={duplicateShelf}
+              renameShelf={renameShelf}
               addWaypoint={addWaypoint}
               removeLastWaypoint={removeLastWaypoint}
               clearWaypoints={clearWaypoints}
+              deleteWaypointAt={deleteWaypointAt}
+              setWaypointLookAtAtIndex={setWaypointLookAtAtIndex}
+              teleportToWaypoint={teleportToWaypoint}
               setLookAtTarget={setLookAtTarget}
               setHomeFromCamera={setHomeFromCamera}
               gotoHome={gotoHome}
@@ -2009,6 +2235,14 @@ export default function App() {
               setServerConfigName={setServerConfigName}
               saveConfigToServer={saveConfigToServer}
               loadConfigFromServer={loadConfigFromServer}
+              logoutAdmin={logoutAdmin}
+              showChangePassword={showChangePassword}
+              setShowChangePassword={setShowChangePassword}
+              newPasswordInput={newPasswordInput}
+              setNewPasswordInput={setNewPasswordInput}
+              changePassword={changePassword}
+              passwordError={passwordError}
+              setPasswordError={setPasswordError}
             />
           )}
 
@@ -2104,6 +2338,46 @@ export default function App() {
           }}
         />
       )}
+
+      {/* Admin password modal */}
+      {showPasswordModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.7)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowPasswordModal(false); }}
+        >
+          <div
+            className="panel"
+            style={{ width: 280, pointerEvents: "auto" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h4 style={{ marginTop: 0, marginBottom: 12 }}>Admin Login</h4>
+            <input
+              type="password"
+              placeholder="Password"
+              value={passwordInput}
+              autoFocus
+              onChange={(e) => { setPasswordInput(e.target.value); setPasswordError(""); }}
+              onKeyDown={(e) => e.key === "Enter" && loginAdmin()}
+              style={{ width: "100%", marginBottom: 8 }}
+            />
+            {passwordError && (
+              <div style={{ fontSize: 11, color: "#f87171", marginBottom: 8 }}>{passwordError}</div>
+            )}
+            <div className="row">
+              <button className="primary" onClick={loginAdmin}>Login</button>
+              <button onClick={() => setShowPasswordModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2120,9 +2394,14 @@ function AdminPanel(props: {
   setNewShelfBarcode: (s: string) => void;
   createShelf: () => void;
   deleteShelf: (id: string) => void;
+  duplicateShelf: (id: string) => void;
+  renameShelf: (oldId: string, newId: string, barcode: string) => void;
   addWaypoint: () => void;
   removeLastWaypoint: () => void;
   clearWaypoints: () => void;
+  deleteWaypointAt: (shelfId: string, index: number) => void;
+  setWaypointLookAtAtIndex: (shelfId: string, index: number) => void;
+  teleportToWaypoint: (shelfId: string, index: number) => void;
   setLookAtTarget: () => void;
   setHomeFromCamera: () => void;
   gotoHome: () => void;
@@ -2149,6 +2428,14 @@ function AdminPanel(props: {
   setServerConfigName: (s: string) => void;
   saveConfigToServer: () => void;
   loadConfigFromServer: (name: string) => void;
+  logoutAdmin: () => void;
+  showChangePassword: boolean;
+  setShowChangePassword: (v: boolean) => void;
+  newPasswordInput: string;
+  setNewPasswordInput: (v: string) => void;
+  changePassword: () => void;
+  passwordError: string;
+  setPasswordError: (v: string) => void;
 }) {
   const {
     config,
@@ -2161,9 +2448,14 @@ function AdminPanel(props: {
     setNewShelfBarcode,
     createShelf,
     deleteShelf,
+    duplicateShelf,
+    renameShelf,
     addWaypoint,
     removeLastWaypoint,
     clearWaypoints,
+    deleteWaypointAt,
+    setWaypointLookAtAtIndex,
+    teleportToWaypoint,
     setLookAtTarget,
     setHomeFromCamera,
     gotoHome,
@@ -2190,7 +2482,18 @@ function AdminPanel(props: {
     setServerConfigName,
     saveConfigToServer,
     loadConfigFromServer,
+    logoutAdmin,
+    showChangePassword,
+    setShowChangePassword,
+    newPasswordInput,
+    setNewPasswordInput,
+    changePassword,
+    passwordError,
+    setPasswordError,
   } = props;
+  const [renameShelfId, setRenameShelfId] = useState("");
+  const [renameShelfBarcode, setRenameShelfBarcode] = useState("");
+  const [renamingId, setRenamingId] = useState<string | null>(null);
 
   const shelfList = Object.values(config.shelves);
   const selectedTransform: Transform | null =
@@ -2397,6 +2700,34 @@ function AdminPanel(props: {
             </button>
           </div>
 
+          {/* Rename / Duplicate shelf */}
+          <div className="col" style={{ gap: 4 }}>
+            <h4>Shelf Identity</h4>
+            {renamingId === activeShelf.id ? (
+              <>
+                <input
+                  placeholder="New shelf ID"
+                  value={renameShelfId}
+                  onChange={(e) => setRenameShelfId(e.target.value)}
+                />
+                <input
+                  placeholder="Barcode"
+                  value={renameShelfBarcode}
+                  onChange={(e) => setRenameShelfBarcode(e.target.value)}
+                />
+                <div className="row">
+                  <button className="primary" onClick={() => { renameShelf(activeShelf.id, renameShelfId, renameShelfBarcode); setRenamingId(null); }}>Save</button>
+                  <button onClick={() => setRenamingId(null)}>Cancel</button>
+                </div>
+              </>
+            ) : (
+              <div className="row">
+                <button onClick={() => { setRenameShelfId(activeShelf.id); setRenameShelfBarcode(activeShelf.barcode); setRenamingId(activeShelf.id); }}>Rename / Barcode</button>
+                <button onClick={() => duplicateShelf(activeShelf.id)}>Duplicate</button>
+              </div>
+            )}
+          </div>
+
           {(mode === "admin-path-edit" || mode === "admin-free") && (
             <div className="col">
               <h4>Path Tools</h4>
@@ -2413,11 +2744,45 @@ function AdminPanel(props: {
                   Clear
                 </button>
               </div>
-              <button onClick={setLookAtTarget}>Set LookAt Target</button>
-              <div className="muted">
-                Waypoints: {activeShelf.waypoints.length} ·{" "}
+              <button onClick={setLookAtTarget}>Set Final LookAt</button>
+              <div className="muted" style={{ fontSize: 11 }}>
                 LookAt: {activeShelf.lookAt ? "set" : "—"}
               </div>
+
+              {/* Waypoint list */}
+              {activeShelf.waypoints.length > 0 && (
+                <div className="col" style={{ gap: 3, marginTop: 4 }}>
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>Waypoints (click to teleport)</div>
+                  {activeShelf.waypoints.map((wp, i) => {
+                    const la = (activeShelf.waypointLookAts ?? [])[i];
+                    return (
+                      <div key={i} className="row" style={{ gap: 4, fontSize: 11, alignItems: "center" }}>
+                        <button
+                          style={{ flex: 1, fontSize: 10, padding: "3px 5px", textAlign: "left" }}
+                          onClick={() => teleportToWaypoint(activeShelfId!, i)}
+                        >
+                          {i + 1}. ({wp.x.toFixed(1)}, {wp.y.toFixed(1)}, {wp.z.toFixed(1)})
+                          {la ? " 👁" : ""}
+                        </button>
+                        <button
+                          title="Set look direction for this waypoint from current camera"
+                          style={{ fontSize: 10, padding: "3px 5px" }}
+                          onClick={() => setWaypointLookAtAtIndex(activeShelfId!, i)}
+                        >
+                          Look
+                        </button>
+                        <button
+                          className="danger"
+                          style={{ fontSize: 10, padding: "3px 5px" }}
+                          onClick={() => deleteWaypointAt(activeShelfId!, i)}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -2601,6 +2966,32 @@ function AdminPanel(props: {
           Uploading…
         </div>
       )}
+
+      <div className="divider" />
+      <div className="col" style={{ gap: 4 }}>
+        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Admin Account</div>
+        {showChangePassword ? (
+          <>
+            <input
+              type="password"
+              placeholder="New password"
+              value={newPasswordInput}
+              onChange={(e) => { setNewPasswordInput(e.target.value); setPasswordError(""); }}
+              onKeyDown={(e) => e.key === "Enter" && changePassword()}
+            />
+            {passwordError && <div style={{ fontSize: 11, color: "#f87171" }}>{passwordError}</div>}
+            <div className="row">
+              <button className="primary" onClick={changePassword}>Save</button>
+              <button onClick={() => { setShowChangePassword(false); setNewPasswordInput(""); setPasswordError(""); }}>Cancel</button>
+            </div>
+          </>
+        ) : (
+          <div className="row">
+            <button onClick={() => setShowChangePassword(true)}>Change Password</button>
+            <button className="danger" onClick={logoutAdmin}>Log Out</button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
