@@ -49,6 +49,23 @@ type TransformAxis = "x" | "y" | "z" | null;
 
 const STORAGE_KEY = "warehouse-router-config";
 
+// When running on Pi, the API is served from the same origin.
+// In Replit dev, the proxy routes /api to the backend.
+const API_BASE = "/api";
+
+async function uploadFile(file: File, type: "glb" | "photo"): Promise<string> {
+  const endpoint = type === "glb" ? `${API_BASE}/upload/glb` : `${API_BASE}/upload/photo`;
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(endpoint, { method: "POST", body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error ?? "Upload failed");
+  }
+  const data = await res.json();
+  return data.url as string;
+}
+
 const identityTransform = (): Transform => ({
   position: { x: 0, y: 0, z: 0 },
   rotation: { x: 0, y: 0, z: 0 },
@@ -127,6 +144,9 @@ export default function App() {
   const [selectedObjectId, setSelectedObjectId] = useState<SelectionId>(null);
   const [transformHud, setTransformHud] = useState<string>("");
   const [webglError, setWebglError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [serverConfigs, setServerConfigs] = useState<string[]>([]);
+  const [serverConfigName, setServerConfigName] = useState("default");
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -1206,48 +1226,122 @@ export default function App() {
   }
 
   // ---------- File handling ----------
+  function fetchServerConfigs() {
+    fetch(`${API_BASE}/configs`)
+      .then((r) => r.json())
+      .then((d) => setServerConfigs(d.configs ?? []))
+      .catch(() => {});
+  }
+
+  useEffect(() => {
+    fetchServerConfigs();
+  }, []);
+
   function onGlbUpload(file: File) {
-    const url = URL.createObjectURL(file);
-    setConfig((c) => ({ ...c, glbUrl: url }));
+    setUploading(true);
+    setStatusMsg("Uploading GLB...");
+    uploadFile(file, "glb")
+      .then((url) => {
+        setConfig((c) => ({ ...c, glbUrl: url }));
+        setStatusMsg("GLB uploaded and loaded.");
+      })
+      .catch((e) => {
+        // Fall back to blob URL if server unavailable
+        const url = URL.createObjectURL(file);
+        setConfig((c) => ({ ...c, glbUrl: url }));
+        setStatusMsg(`Server upload failed (${e.message}), loaded locally.`);
+      })
+      .finally(() => setUploading(false));
   }
 
   function onPanoUpload(file: File) {
     if (!activeShelfId) return;
-    const url = URL.createObjectURL(file);
-    setConfig((c) => {
-      const shelf = c.shelves[activeShelfId];
-      if (!shelf) return c;
-      return {
-        ...c,
-        shelves: {
-          ...c.shelves,
-          [activeShelfId]: { ...shelf, panoramaUrl: url },
-        },
-      };
-    });
-    setStatusMsg("Panorama image loaded.");
+    const shelfId = activeShelfId;
+    setUploading(true);
+    setStatusMsg("Uploading panorama...");
+    uploadFile(file, "photo")
+      .then((url) => {
+        setConfig((c) => {
+          const shelf = c.shelves[shelfId];
+          if (!shelf) return c;
+          return { ...c, shelves: { ...c.shelves, [shelfId]: { ...shelf, panoramaUrl: url } } };
+        });
+        setStatusMsg("Panorama uploaded and loaded.");
+      })
+      .catch((e) => {
+        const url = URL.createObjectURL(file);
+        setConfig((c) => {
+          const shelf = c.shelves[shelfId];
+          if (!shelf) return c;
+          return { ...c, shelves: { ...c.shelves, [shelfId]: { ...shelf, panoramaUrl: url } } };
+        });
+        setStatusMsg(`Server upload failed (${e.message}), loaded locally.`);
+      })
+      .finally(() => setUploading(false));
   }
 
   function onObjectUpload(file: File) {
-    const url = URL.createObjectURL(file);
     const id =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
         : `obj_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const baseName = file.name.replace(/\.(glb|gltf)$/i, "");
-    const newObj: SceneObject = {
-      id,
-      name: baseName || "Object",
-      url,
-      transform: {
-        position: { x: 0, y: 0, z: 0 },
-        rotation: { x: 0, y: 0, z: 0 },
-        scale: { x: 1, y: 1, z: 1 },
-      },
+    setUploading(true);
+    setStatusMsg("Uploading object...");
+    uploadFile(file, "glb")
+      .then((url) => {
+        const newObj: SceneObject = {
+          id, name: baseName || "Object", url,
+          transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } },
+        };
+        setConfig((c) => ({ ...c, objects: [...c.objects, newObj] }));
+        setSelectedObjectId(id);
+        setStatusMsg(`Imported "${newObj.name}".`);
+      })
+      .catch((e) => {
+        const url = URL.createObjectURL(file);
+        const newObj: SceneObject = {
+          id, name: baseName || "Object", url,
+          transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0 }, scale: { x: 1, y: 1, z: 1 } },
+        };
+        setConfig((c) => ({ ...c, objects: [...c.objects, newObj] }));
+        setSelectedObjectId(id);
+        setStatusMsg(`Server upload failed (${e.message}), loaded locally.`);
+      })
+      .finally(() => setUploading(false));
+  }
+
+  function saveConfigToServer() {
+    const name = serverConfigName.trim() || "default";
+    const cleaned: Config = {
+      ...config,
+      glbUrl: config.glbUrl?.startsWith("blob:") ? null : config.glbUrl,
+      shelves: Object.fromEntries(
+        Object.entries(config.shelves).map(([k, s]) => [k, { ...s, panoramaUrl: s.panoramaUrl?.startsWith("blob:") ? null : s.panoramaUrl }])
+      ),
+      objects: config.objects.map((o) => ({ ...o, url: o.url.startsWith("blob:") ? "" : o.url })),
     };
-    setConfig((c) => ({ ...c, objects: [...c.objects, newObj] }));
-    setSelectedObjectId(id);
-    setStatusMsg(`Imported "${newObj.name}".`);
+    fetch(`${API_BASE}/configs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, config: cleaned }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        setStatusMsg(`Config saved as "${d.name}".`);
+        fetchServerConfigs();
+      })
+      .catch((e) => setStatusMsg(`Save failed: ${e.message}`));
+  }
+
+  function loadConfigFromServer(name: string) {
+    fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        setConfig({ ...defaultConfig, ...data });
+        setStatusMsg(`Config "${name}" loaded from server.`);
+      })
+      .catch((e) => setStatusMsg(`Load failed: ${e.message}`));
   }
 
   function removeObject(id: string) {
@@ -1909,6 +2003,12 @@ export default function App() {
               updateObjectTransform={updateObjectTransform}
               resetObjectTransform={resetObjectTransform}
               setConfig={setConfig}
+              uploading={uploading}
+              serverConfigs={serverConfigs}
+              serverConfigName={serverConfigName}
+              setServerConfigName={setServerConfigName}
+              saveConfigToServer={saveConfigToServer}
+              loadConfigFromServer={loadConfigFromServer}
             />
           )}
 
@@ -2043,6 +2143,12 @@ function AdminPanel(props: {
   updateObjectTransform: (id: SelectionId, t: Transform) => void;
   resetObjectTransform: (id: SelectionId) => void;
   setConfig: React.Dispatch<React.SetStateAction<Config>>;
+  uploading: boolean;
+  serverConfigs: string[];
+  serverConfigName: string;
+  setServerConfigName: (s: string) => void;
+  saveConfigToServer: () => void;
+  loadConfigFromServer: (name: string) => void;
 }) {
   const {
     config,
@@ -2078,6 +2184,12 @@ function AdminPanel(props: {
     updateObjectTransform,
     resetObjectTransform,
     setConfig,
+    uploading,
+    serverConfigs,
+    serverConfigName,
+    setServerConfigName,
+    saveConfigToServer,
+    loadConfigFromServer,
   } = props;
 
   const shelfList = Object.values(config.shelves);
@@ -2413,34 +2525,82 @@ function AdminPanel(props: {
       <div className="divider" />
 
       <h4>Config</h4>
-      <div className="row">
-        <button onClick={exportConfig}>Download JSON</button>
-        <label
-          style={{
-            display: "inline-block",
-            background: "#2a3038",
-            border: "1px solid #3a414b",
-            padding: "6px 10px",
-            borderRadius: 4,
-            cursor: "pointer",
-            fontSize: 12,
-            textTransform: "none",
-            letterSpacing: 0,
-            fontWeight: 500,
-          }}
-        >
-          Load JSON
+
+      <div className="col" style={{ gap: 4 }}>
+        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Save / load on this device</div>
+        <div className="row" style={{ gap: 4 }}>
           <input
-            type="file"
-            accept="application/json"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) importConfig(f);
-            }}
+            value={serverConfigName}
+            onChange={(e) => setServerConfigName(e.target.value)}
+            placeholder="Config name"
+            style={{ flex: 1, fontSize: 12 }}
           />
-        </label>
+          <button
+            className="primary"
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            onClick={saveConfigToServer}
+          >
+            Save
+          </button>
+        </div>
+        {serverConfigs.length > 0 && (
+          <div className="row" style={{ gap: 4 }}>
+            <select
+              style={{ flex: 1, fontSize: 12 }}
+              defaultValue=""
+              onChange={(e) => {
+                if (e.target.value) loadConfigFromServer(e.target.value);
+                e.target.value = "";
+              }}
+            >
+              <option value="">— Load saved config —</option>
+              {serverConfigs.map((n) => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
+
+      <div className="divider" />
+
+      <div className="col" style={{ gap: 4 }}>
+        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Import / export JSON file</div>
+        <div className="row">
+          <button onClick={exportConfig}>Download JSON</button>
+          <label
+            style={{
+              display: "inline-block",
+              background: "#2a3038",
+              border: "1px solid #3a414b",
+              padding: "6px 10px",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 12,
+              textTransform: "none",
+              letterSpacing: 0,
+              fontWeight: 500,
+            }}
+          >
+            Load JSON
+            <input
+              type="file"
+              accept="application/json"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importConfig(f);
+              }}
+            />
+          </label>
+        </div>
+      </div>
+
+      {uploading && (
+        <div style={{ fontSize: 11, color: "#60a5fa", textAlign: "center", marginTop: 4 }}>
+          Uploading…
+        </div>
+      )}
     </div>
   );
 }
