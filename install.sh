@@ -2,25 +2,32 @@
 # ============================================================
 # Warehouse NAV  —  Raspberry Pi installer
 # Usage:  curl -fsSL https://raw.githubusercontent.com/RX-LOST/Warehouse-NAV/main/install.sh | bash
-# Or:     bash install.sh [--port 3000] [--data-dir /var/lib/warehouse-nav] [--no-service]
+# Or:     bash install.sh [--port 8443] [--data-dir /var/lib/warehouse-nav] [--no-service] [--tailscale-funnel]
+#
+# Tailscale Funnel (remote access without port-forwarding):
+#   Pass --tailscale-funnel to enable it automatically after install.
+#   Or run manually:   sudo tailscale funnel 8443
+#   To disable:        sudo tailscale funnel reset
 # ============================================================
 set -euo pipefail
 
 # ---------- Defaults ----------
-PORT="${PORT:-3000}"
+PORT="${PORT:-8443}"
 DATA_DIR="${DATA_DIR:-/var/lib/warehouse-nav}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/warehouse-nav}"
 REPO_URL="${REPO_URL:-https://github.com/RX-LOST/Warehouse-NAV.git}"
 SERVICE_NAME="warehouse-nav"
 NO_SERVICE=0
+TAILSCALE_FUNNEL=0
 
 # ---------- Parse args ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)       PORT="$2";       shift 2 ;;
-    --data-dir)   DATA_DIR="$2";   shift 2 ;;
-    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
-    --no-service) NO_SERVICE=1;    shift ;;
+    --port)            PORT="$2";       shift 2 ;;
+    --data-dir)        DATA_DIR="$2";   shift 2 ;;
+    --install-dir)     INSTALL_DIR="$2"; shift 2 ;;
+    --no-service)      NO_SERVICE=1;    shift ;;
+    --tailscale-funnel) TAILSCALE_FUNNEL=1; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -166,5 +173,22 @@ echo "    http://$LOCAL_IP:$PORT"
 echo ""
 echo "  Uploaded files stored in: $DATA_DIR"
 echo "  To update:  bash $INSTALL_DIR/install.sh"
+echo ""
+echo "  Tailscale Funnel (remote access):"
+echo "    Enable:   sudo tailscale funnel $PORT"
+echo "    Disable:  sudo tailscale funnel reset"
 echo "========================================"
 echo ""
+
+# ---------- Optional Tailscale Funnel ----------
+if [[ $TAILSCALE_FUNNEL -eq 1 ]]; then
+  if command -v tailscale &>/dev/null; then
+    info "Enabling Tailscale Funnel on port $PORT…"
+    $SUDO tailscale funnel "$PORT" && \
+      success "Tailscale Funnel enabled on port $PORT." || \
+      warn "tailscale funnel failed — run manually: sudo tailscale funnel $PORT"
+  else
+    warn "tailscale not found. Install: curl -fsSL https://tailscale.com/install.sh | sh"
+    warn "Then run: sudo tailscale funnel $PORT"
+  fi
+fi

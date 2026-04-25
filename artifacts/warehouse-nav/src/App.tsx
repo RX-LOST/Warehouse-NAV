@@ -1,23 +1,29 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import NodeGraphView from "./NodeGraphView";
+import {
+  type PathNode,
+  type Vec3,
+  buildNavPath,
+  computeArcLengths,
+  samplePath,
+  nearestNodeId,
+  v3dist,
+} from "./pathfinding";
 
-type Vec3 = { x: number; y: number; z: number };
-
+/** Shelf is now just a camera pose + panorama data. Routing is handled by path nodes. */
 type Shelf = {
   id: string;
   barcode: string;
-  waypoints: Vec3[];
-  waypointLookAts: (Vec3 | null)[]; // per-waypoint camera look target (independent rotation)
-  lookAt: Vec3 | null;
+  cameraPosition: Vec3;
+  cameraLookAt: Vec3 | null;
   panoramaUrl: string | null;
   panoramaYaw: number;
   panoramaPitch: number;
   panoramaFov: number;
   markerYaw: number | null;
   markerPitch: number | null;
-  durationSec: number;
-  tension: number;
 };
 
 type Transform = {
@@ -35,14 +41,18 @@ type SceneObject = {
 
 type Config = {
   glbUrl: string | null;
+  splatUrl: string | null;          // Gaussian splat scene URL
   glbTransform: Transform;
   objects: SceneObject[];
   homePosition: Vec3;
   homeLookAt: Vec3;
+  homeNodeId: string | null;        // path node linked to home position
+  pathNodes: Record<string, PathNode>;
+  cameraSpeed: number;              // units per second (default 3)
   shelves: Record<string, Shelf>;
 };
 
-type AppMode = "admin-free" | "admin-path-edit" | "admin-pano-edit" | "playback" | "panorama";
+type AppMode = "admin-free" | "admin-node-edit" | "admin-pano-edit" | "navigating" | "panorama";
 
 type SelectionId = "scene" | string | null;
 type TransformTool = "translate" | "rotate" | "scale";
@@ -75,10 +85,14 @@ const identityTransform = (): Transform => ({
 
 const defaultConfig: Config = {
   glbUrl: null,
+  splatUrl: null,
   glbTransform: identityTransform(),
   objects: [],
   homePosition: { x: 0, y: 2, z: 5 },
   homeLookAt: { x: 0, y: 1, z: 0 },
+  homeNodeId: null,
+  pathNodes: {},
+  cameraSpeed: 3,
   shelves: {},
 };
 
@@ -88,26 +102,42 @@ function loadConfig(): Config {
     if (raw) {
       const parsed = JSON.parse(raw);
       const merged = { ...defaultConfig, ...parsed };
-      // Backfill new shelf fields for older saved configs
+
+      // Migrate old shelf format (had waypoints[]) to new cameraPosition/cameraLookAt
       merged.shelves = Object.fromEntries(
         Object.entries(merged.shelves || {}).map(([k, s]) => {
-          const shelf = s as Partial<Shelf> & { waypoints?: Vec3[] };
-          const wps = shelf.waypoints ?? [];
-          return [
-            k,
-            {
-              durationSec: 4,
-              tension: 0.5,
-              ...shelf,
-              waypointLookAts: Array.isArray(shelf.waypointLookAts) && shelf.waypointLookAts.length === wps.length
-                ? shelf.waypointLookAts
-                : new Array(wps.length).fill(null),
-            } as Shelf,
-          ];
+          const old = s as Record<string, unknown>;
+          // If it's already new format, keep it
+          if (old.cameraPosition) {
+            return [k, { panoramaYaw: 0, panoramaPitch: 0, panoramaFov: 75, markerYaw: null, markerPitch: null, cameraLookAt: null, ...old } as Shelf];
+          }
+          // Migrate from old waypoints-based format
+          const wps = (old.waypoints as Vec3[] | undefined) ?? [];
+          const lastWp = wps[wps.length - 1] ?? { x: 0, y: 2, z: 0 };
+          const migrated: Shelf = {
+            id: String(old.id ?? k),
+            barcode: String(old.barcode ?? ""),
+            cameraPosition: lastWp,
+            cameraLookAt: (old.lookAt as Vec3 | null) ?? null,
+            panoramaUrl: (old.panoramaUrl as string | null) ?? null,
+            panoramaYaw: Number(old.panoramaYaw ?? 0),
+            panoramaPitch: Number(old.panoramaPitch ?? 0),
+            panoramaFov: Number(old.panoramaFov ?? 75),
+            markerYaw: (old.markerYaw as number | null) ?? null,
+            markerPitch: (old.markerPitch as number | null) ?? null,
+          };
+          return [k, migrated];
         }),
       );
+
+      // Backfill new Config fields
       if (!merged.glbTransform) merged.glbTransform = identityTransform();
       if (!Array.isArray(merged.objects)) merged.objects = [];
+      if (!merged.pathNodes) merged.pathNodes = {};
+      if (!merged.cameraSpeed || merged.cameraSpeed <= 0) merged.cameraSpeed = 3;
+      if (!merged.homeNodeId) merged.homeNodeId = null;
+      if (!merged.splatUrl) merged.splatUrl = null;
+
       return merged;
     }
   } catch (e) {
@@ -162,6 +192,8 @@ export default function App() {
   const [isRightDragging, setIsRightDragging] = useState(false);
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [newPasswordInput, setNewPasswordInput] = useState("");
+  const [showNodeGraph, setShowNodeGraph] = useState(false);
+  const newNodeIdRef = useRef<string>("n1");
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -202,28 +234,32 @@ export default function App() {
   const lastMouseRef = useRef({ x: 0, y: 0 });
   const virtualMouseRef = useRef({ x: 0, y: 0 });
   const cameraRotateRef = useRef(false);
-  const playbackRef = useRef<{
+
+  // New arc-length navigation ref (replaces playbackRef)
+  const navRef = useRef<{
     active: boolean;
-    curve: THREE.CatmullRomCurve3 | null;
-    duration: number;
-    startTime: number;
-    startQuat: THREE.Quaternion;
+    path: Vec3[];               // full world-space path
+    arcLengths: number[];       // cumulative arc lengths
+    totalLength: number;        // total path length
+    traversed: number;          // distance covered so far
+    speed: number;              // units / second
+    currentQuat: THREE.Quaternion; // smoothed camera orientation
     endLookAt: THREE.Vector3 | null;
-    waypointPositions: Vec3[];
-    waypointLookAts: (Vec3 | null)[];
     onComplete: (() => void) | null;
-    reverse: boolean;
+    lastTimestamp: number;
+    pathLineRef: THREE.Mesh | null; // glow tube (scene object)
   }>({
     active: false,
-    curve: null,
-    duration: 0,
-    startTime: 0,
-    startQuat: new THREE.Quaternion(),
+    path: [],
+    arcLengths: [],
+    totalLength: 0,
+    traversed: 0,
+    speed: 3,
+    currentQuat: new THREE.Quaternion(),
     endLookAt: null,
-    waypointPositions: [],
-    waypointLookAts: [],
     onComplete: null,
-    reverse: false,
+    lastTimestamp: 0,
+    pathLineRef: null,
   });
 
   // Panorama state
@@ -312,10 +348,10 @@ export default function App() {
     const grid = new THREE.GridHelper(50, 50, 0x444444, 0x222222);
     scene.add(grid);
 
-    // Waypoint markers group
-    const wpGroup = new THREE.Group();
-    scene.add(wpGroup);
-    waypointMarkersRef.current = wpGroup;
+    // Path node markers group (only visible in admin modes)
+    const nodeGroup = new THREE.Group();
+    scene.add(nodeGroup);
+    waypointMarkersRef.current = nodeGroup; // reuse ref name for now
 
     // Initial camera orientation derived from homeLookAt
     {
@@ -346,7 +382,7 @@ export default function App() {
       const dt = Math.min(0.1, (now - lastTime) / 1000);
       lastTime = now;
       updateCamera(dt);
-      updatePlayback();
+      updateNavigation(dt);
       if (selectionBoxRef.current) {
         (selectionBoxRef.current as THREE.BoxHelper).update();
       }
@@ -397,6 +433,66 @@ export default function App() {
     // Intentionally only re-run on glbUrl change (transform handled separately)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.glbUrl]);
+
+  // ---------- Gaussian splat loading ----------
+  const splatRootRef = useRef<THREE.Object3D | null>(null);
+  const splatViewerRef = useRef<{ dispose?: () => void } | null>(null);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const renderer = rendererRef.current;
+    const camera = cameraRef.current;
+    if (!scene || !renderer || !camera) return;
+
+    // Cleanup previous splat
+    if (splatRootRef.current) {
+      scene.remove(splatRootRef.current);
+      splatRootRef.current = null;
+    }
+    if (splatViewerRef.current?.dispose) {
+      splatViewerRef.current.dispose();
+      splatViewerRef.current = null;
+    }
+    if (!config.splatUrl) return;
+
+    // Device capability check: require WebGL2 + reasonable GPU
+    const canvas = renderer.domElement;
+    const gl = canvas.getContext("webgl2");
+    if (!gl) {
+      setStatusMsg("Gaussian splats require WebGL2 (not supported on this device).");
+      return;
+    }
+
+    setStatusMsg("Loading Gaussian splat scene…");
+
+    // Dynamic import to avoid breaking low-end devices at bundle time
+    import("@mkkellogg/gaussian-splats-3d").then((GS) => {
+      const viewer = new GS.Viewer({
+        renderer,
+        camera,
+        useBuiltInControls: false,
+        selfDrivenMode: false,
+        threeScene: scene,
+      });
+      splatViewerRef.current = viewer;
+      viewer.addSplatScene(config.splatUrl!, { showLoadingUI: false })
+        .then(() => {
+          setStatusMsg("Gaussian splat loaded.");
+        })
+        .catch((err: unknown) => {
+          console.error("Splat load error", err);
+          setStatusMsg("Failed to load Gaussian splat.");
+        });
+    }).catch(() => {
+      setStatusMsg("Gaussian splat library not available on this device.");
+    });
+
+    return () => {
+      if (splatViewerRef.current?.dispose) splatViewerRef.current.dispose();
+      splatViewerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.splatUrl]);
 
   // Apply scene GLB transform when it changes
   useEffect(() => {
@@ -491,72 +587,77 @@ export default function App() {
     selectionBoxRef.current = helper;
   }
 
-  // ---------- Update waypoint visualization on shelf change ----------
+  // ---------- Update path node visualization (admin only) ----------
   useEffect(() => {
-    renderWaypointVisualization();
+    renderNodeVisualization();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeShelfId, config.shelves, mode]);
+  }, [config.pathNodes, config.homeNodeId, mode, activeShelfId]);
 
-  function renderWaypointVisualization() {
+  function renderNodeVisualization() {
     const scene = sceneRef.current;
-    const wpGroup = waypointMarkersRef.current;
-    if (!scene || !wpGroup) return;
-    // Clear
-    while (wpGroup.children.length) wpGroup.remove(wpGroup.children[0]);
+    const nodeGroup = waypointMarkersRef.current;
+    if (!scene || !nodeGroup) return;
+
+    // Clear previous markers
+    while (nodeGroup.children.length) nodeGroup.remove(nodeGroup.children[0]);
+    // Also clear any old spline line
     if (splineLineRef.current) {
       scene.remove(splineLineRef.current);
-      splineLineRef.current.geometry.dispose();
+      (splineLineRef.current as THREE.Line).geometry?.dispose();
       splineLineRef.current = null;
     }
     if (lookAtMarkerRef.current) {
       scene.remove(lookAtMarkerRef.current);
       lookAtMarkerRef.current = null;
     }
-    if (
-      modeRef.current !== "admin-free" &&
-      modeRef.current !== "admin-path-edit" &&
-      modeRef.current !== "admin-pano-edit"
-    )
-      return;
-    if (!activeShelfId) return;
-    const shelf = config.shelves[activeShelfId];
-    if (!shelf) return;
 
-    const sphereGeo = new THREE.SphereGeometry(0.12, 16, 16);
-    shelf.waypoints.forEach((wp, i) => {
-      const isFirst = i === 0;
-      const isLast = i === shelf.waypoints.length - 1;
-      const color = isFirst ? 0x22c55e : isLast ? 0xef4444 : 0xfacc15;
-      const mat = new THREE.MeshBasicMaterial({ color });
+    const isAdmin =
+      modeRef.current === "admin-free" ||
+      modeRef.current === "admin-node-edit" ||
+      modeRef.current === "admin-pano-edit";
+    if (!isAdmin) return;
+
+    const nodes = config.pathNodes;
+    const sphereGeo = new THREE.SphereGeometry(0.14, 12, 12);
+    const drawnLinks = new Set<string>();
+
+    for (const node of Object.values(nodes)) {
+      const isHome = node.id === config.homeNodeId;
+      const mat = new THREE.MeshBasicMaterial({
+        color: isHome ? 0xf59e0b : 0x3b82f6,
+        transparent: true,
+        opacity: 0.85,
+      });
       const mesh = new THREE.Mesh(sphereGeo, mat);
-      mesh.position.set(wp.x, wp.y, wp.z);
-      wpGroup.add(mesh);
-    });
+      mesh.position.set(node.position.x, node.position.y, node.position.z);
+      nodeGroup.add(mesh);
 
-    if (shelf.waypoints.length >= 2) {
-      const points = shelf.waypoints.map((w) => fromV3(w));
-      const curve = new THREE.CatmullRomCurve3(
-        points,
-        false,
-        "catmullrom",
-        shelf.tension ?? 0.5,
-      );
-      const samples = curve.getPoints(Math.max(64, shelf.waypoints.length * 16));
-      const geo = new THREE.BufferGeometry().setFromPoints(samples);
-      const mat = new THREE.LineBasicMaterial({ color: 0x60a5fa });
-      const line = new THREE.Line(geo, mat);
-      scene.add(line);
-      splineLineRef.current = line;
+      // Draw links
+      for (const toId of node.links) {
+        const key = [node.id, toId].sort().join("|");
+        if (drawnLinks.has(key)) continue;
+        drawnLinks.add(key);
+        const to = nodes[toId];
+        if (!to) continue;
+        const pts = [fromV3(node.position), fromV3(to.position)];
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x475569, transparent: true, opacity: 0.6 });
+        const line = new THREE.Line(geo, lineMat);
+        nodeGroup.add(line);
+      }
     }
 
-    if (shelf.lookAt) {
-      const m = new THREE.Mesh(
-        new THREE.SphereGeometry(0.18, 16, 16),
-        new THREE.MeshBasicMaterial({ color: 0x06b6d4, wireframe: true }),
-      );
-      m.position.set(shelf.lookAt.x, shelf.lookAt.y, shelf.lookAt.z);
-      scene.add(m);
-      lookAtMarkerRef.current = m;
+    // Show active shelf camera position marker
+    if (activeShelfId) {
+      const shelf = config.shelves[activeShelfId];
+      if (shelf?.cameraPosition) {
+        const m = new THREE.Mesh(
+          new THREE.SphereGeometry(0.2, 12, 12),
+          new THREE.MeshBasicMaterial({ color: 0x22c55e, wireframe: true }),
+        );
+        m.position.set(shelf.cameraPosition.x, shelf.cameraPosition.y, shelf.cameraPosition.z);
+        nodeGroup.add(m);
+      }
     }
   }
 
@@ -576,8 +677,8 @@ export default function App() {
       }
       keysRef.current[e.code] = true;
       const m = modeRef.current;
-      const inAdmin = m === "admin-free" || m === "admin-path-edit";
-      // 'M' shortcut to add waypoint
+      const inAdmin = m === "admin-free" || m === "admin-node-edit";
+      // 'M' shortcut to save shelf pose
       if (e.code === "KeyM" && !e.repeat && inAdmin) {
         addWaypointRef.current();
         return;
@@ -644,9 +745,9 @@ export default function App() {
   function updateCamera(dt: number) {
     const cam = cameraRef.current;
     if (!cam) return;
-    if (playbackRef.current.active) return;
+    if (navRef.current.active) return;
     const m = modeRef.current;
-    const adminFree = m === "admin-free" || m === "admin-path-edit";
+    const adminFree = m === "admin-free" || m === "admin-node-edit";
     if (!adminFree) return;
 
     const speed = (keysRef.current["ShiftLeft"] ? 8 : 3) * dt;
@@ -678,7 +779,7 @@ export default function App() {
     const dom = renderer.domElement;
     const onMouseDown = (e: MouseEvent) => {
       const m = modeRef.current;
-      if (m !== "admin-free" && m !== "admin-path-edit") return;
+      if (m !== "admin-free" && m !== "admin-node-edit") return;
       // While a transform gesture is active: LMB confirms, RMB cancels
       if (transformRef.current.active) {
         e.preventDefault();
@@ -760,7 +861,7 @@ export default function App() {
     };
     const onWheel = (e: WheelEvent) => {
       const m = modeRef.current;
-      if (m !== "admin-free" && m !== "admin-path-edit") return;
+      if (m !== "admin-free" && m !== "admin-node-edit") return;
       const cam = cameraRef.current;
       if (!cam) return;
       e.preventDefault();
@@ -978,151 +1079,199 @@ export default function App() {
     return null;
   }
 
-  // ---------- Playback (spline traversal) ----------
-  function updatePlayback() {
-    const pb = playbackRef.current;
-    const cam = cameraRef.current;
-    if (!pb.active || !pb.curve || !cam) return;
-    const t = Math.min(1, (performance.now() - pb.startTime) / pb.duration);
-    const eased = easeInOutCubic(t);
-    const u = pb.reverse ? 1 - eased : eased;
-
-    // --- Position: follow spline ---
-    const pos = pb.curve.getPoint(u);
-    cam.position.copy(pos);
-
-    const up = new THREE.Vector3(0, 1, 0);
-    const wps = pb.waypointPositions;
-    const wlas = pb.waypointLookAts;
-    const n = wps.length;
-
-    const buildQ = (i: number): THREE.Quaternion => {
-      const la = wlas[i];
-      if (la) {
-        const wpPos = fromV3(wps[i]);
-        const lookTarget = fromV3(la);
-        if (wpPos.distanceTo(lookTarget) > 0.001) {
-          const m = new THREE.Matrix4().lookAt(wpPos, lookTarget, up);
-          return new THREE.Quaternion().setFromRotationMatrix(m);
-        }
-      }
-      const tU = n <= 1 ? 0.5 : Math.max(0.001, Math.min(0.999, i / (n - 1)));
-      const tang = pb.curve!.getTangent(tU).normalize();
-      if (pb.reverse) tang.multiplyScalar(-1);
-      const m = new THREE.Matrix4().lookAt(new THREE.Vector3(), tang, up);
-      return new THREE.Quaternion().setFromRotationMatrix(m);
-    };
-
-    let q: THREE.Quaternion;
-    if (n < 2) {
-      q = cam.quaternion.clone();
-    } else {
-      const segTotal = n - 1;
-      const rawSeg = u * segTotal;
-      const segIdx = Math.max(0, Math.min(segTotal - 1, Math.floor(rawSeg)));
-      const segT = easeInOutCubic(rawSeg - segIdx);
-      const qa = buildQ(segIdx);
-      const qb = buildQ(Math.min(n - 1, segIdx + 1));
-      q = qa.clone().slerp(qb, segT);
-
-      if (t < 0.08) {
-        const k = easeInOutCubic(t / 0.08);
-        q = pb.startQuat.clone().slerp(q, k);
-      }
-    }
-
-    if (pb.endLookAt && u > 0.85) {
-      const k = easeInOutCubic((u - 0.85) / 0.15);
-      const endM = new THREE.Matrix4().lookAt(pos, pb.endLookAt, up);
-      const endQ = new THREE.Quaternion().setFromRotationMatrix(endM);
-      q = q.clone().slerp(endQ, k);
-    }
-
-    cam.quaternion.copy(q);
-
-    if (t >= 1) {
-      pb.active = false;
-      if (pb.endLookAt) {
-        const m = new THREE.Matrix4().lookAt(pos, pb.endLookAt, up);
-        cam.quaternion.setFromRotationMatrix(m);
-      }
-      const cb = pb.onComplete;
-      pb.onComplete = null;
-      const e = new THREE.Euler().setFromQuaternion(cam.quaternion, "YXZ");
-      yawRef.current = e.y;
-      pitchRef.current = e.x;
-      if (cb) cb();
-    }
-  }
+  // ---------- Navigation: constant-speed arc-length traversal ----------
 
   function easeInOutCubic(x: number) {
     return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
   }
 
-  function startPlayback(
-    waypoints: Vec3[],
-    lookAt: Vec3 | null,
+  /** Create and show the glowing path tube in the scene */
+  function showPathLine(path: Vec3[]) {
+    const scene = sceneRef.current;
+    if (!scene || path.length < 2) return;
+    // Remove old
+    const nav = navRef.current;
+    if (nav.pathLineRef) {
+      scene.remove(nav.pathLineRef);
+      nav.pathLineRef.geometry.dispose();
+      nav.pathLineRef = null;
+    }
+    try {
+      const points = path.map(fromV3);
+      const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
+      const tubeGeo = new THREE.TubeGeometry(curve, Math.max(20, path.length * 8), 0.03, 6, false);
+      // Outer glow: additive blending, low opacity
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0x00c8ff,
+        transparent: true,
+        opacity: 0.25,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const tube = new THREE.Mesh(tubeGeo, glowMat);
+      scene.add(tube);
+      nav.pathLineRef = tube;
+    } catch {
+      // Ignore tube creation errors (very short paths)
+    }
+  }
+
+  function hidePathLine() {
+    const nav = navRef.current;
+    const scene = sceneRef.current;
+    if (nav.pathLineRef && scene) {
+      scene.remove(nav.pathLineRef);
+      nav.pathLineRef.geometry.dispose();
+      nav.pathLineRef = null;
+    }
+  }
+
+  function updateNavigation(dt: number) {
+    const nav = navRef.current;
+    const cam = cameraRef.current;
+    if (!nav.active || !cam || nav.path.length < 2) return;
+
+    const prevTraversed = nav.traversed;
+    nav.traversed = Math.min(nav.totalLength, nav.traversed + nav.speed * dt);
+    const progress = nav.totalLength > 0 ? nav.traversed / nav.totalLength : 1;
+
+    // --- Position ---
+    const { pos } = samplePath(nav.path, nav.arcLengths, nav.traversed);
+    cam.position.set(pos.x, pos.y, pos.z);
+
+    // --- Rotation: smoothly faces direction of travel, independent from position ---
+    const up = new THREE.Vector3(0, 1, 0);
+    const ahead = nav.traversed + 0.5; // look 0.5 units ahead
+    const { pos: aheadPos } = samplePath(nav.path, nav.arcLengths, Math.min(nav.totalLength, ahead));
+    const lookDir = new THREE.Vector3(aheadPos.x - pos.x, aheadPos.y - pos.y, aheadPos.z - pos.z);
+    lookDir.y *= 0.3; // dampen vertical component so camera stays mostly level
+
+    let targetQuat: THREE.Quaternion;
+    if (lookDir.length() > 0.001) {
+      lookDir.normalize();
+      const lookMat = new THREE.Matrix4().lookAt(new THREE.Vector3(), lookDir, up);
+      targetQuat = new THREE.Quaternion().setFromRotationMatrix(lookMat);
+    } else {
+      targetQuat = nav.currentQuat.clone();
+    }
+
+    // Override final 20%: blend toward endLookAt
+    if (nav.endLookAt && progress > 0.8) {
+      const k = easeInOutCubic((progress - 0.8) / 0.2);
+      const curPos = new THREE.Vector3(pos.x, pos.y, pos.z);
+      const dist = curPos.distanceTo(nav.endLookAt);
+      if (dist > 0.01) {
+        const endLookMat = new THREE.Matrix4().lookAt(curPos, nav.endLookAt, up);
+        const endQ = new THREE.Quaternion().setFromRotationMatrix(endLookMat);
+        targetQuat.slerp(endQ, k);
+      }
+    }
+
+    // Smooth rotation: slerp currentQuat toward targetQuat at ~4 rad/s
+    const rotSpeed = Math.min(1, 4 * dt);
+    nav.currentQuat.slerp(targetQuat, rotSpeed);
+    cam.quaternion.copy(nav.currentQuat);
+
+    if (nav.traversed >= nav.totalLength || (prevTraversed === nav.traversed)) {
+      // Arrived
+      nav.active = false;
+      if (nav.endLookAt) {
+        const finalPos = new THREE.Vector3(pos.x, pos.y, pos.z);
+        if (finalPos.distanceTo(nav.endLookAt) > 0.01) {
+          const m = new THREE.Matrix4().lookAt(finalPos, nav.endLookAt, up);
+          cam.quaternion.setFromRotationMatrix(m);
+        }
+      }
+      const e = new THREE.Euler().setFromQuaternion(cam.quaternion, "YXZ");
+      yawRef.current = e.y;
+      pitchRef.current = e.x;
+      hidePathLine();
+      const cb = nav.onComplete;
+      nav.onComplete = null;
+      if (cb) cb();
+    }
+  }
+
+  /**
+   * Start navigating from the camera's current position to toPos via the path graph.
+   * The speed comes from config.cameraSpeed (units/sec).
+   */
+  function startNavigation(
+    toPos: Vec3,
+    endLookAt: Vec3 | null,
     onDone: () => void,
-    reverse = false,
-    durationSec?: number,
-    tension?: number,
-    waypointLookAts?: (Vec3 | null)[],
+    fromNodeOverride?: string | null,
+    toNodeOverride?: string | null,
   ) {
-    if (waypoints.length < 2) {
-      setStatusMsg("Need at least 2 waypoints for playback.");
+    const cam = cameraRef.current;
+    if (!cam) { onDone(); return; }
+
+    const fromPos = toV3(cam.position);
+    const path = buildNavPath(fromPos, toPos, config.pathNodes, fromNodeOverride, toNodeOverride);
+
+    if (path.length < 2) {
+      // Teleport directly
+      cam.position.set(toPos.x, toPos.y, toPos.z);
+      if (endLookAt) {
+        const la = fromV3(endLookAt);
+        const m = new THREE.Matrix4().lookAt(cam.position, la, new THREE.Vector3(0, 1, 0));
+        cam.quaternion.setFromRotationMatrix(m);
+        const e = new THREE.Euler().setFromQuaternion(cam.quaternion, "YXZ");
+        yawRef.current = e.y;
+        pitchRef.current = e.x;
+      }
       onDone();
       return;
     }
-    const points = waypoints.map((w) => fromV3(w));
-    const curve = new THREE.CatmullRomCurve3(
-      points,
-      false,
-      "catmullrom",
-      tension ?? 0.5,
-    );
-    const duration = (durationSec && durationSec > 0 ? durationSec : 4) * 1000;
-    const cam = cameraRef.current!;
-    playbackRef.current = {
+
+    const arcLengths = computeArcLengths(path);
+    const totalLength = arcLengths[arcLengths.length - 1];
+    const speed = Math.max(0.5, config.cameraSpeed);
+
+    navRef.current = {
       active: true,
-      curve,
-      duration,
-      startTime: performance.now(),
-      startQuat: cam.quaternion.clone(),
-      endLookAt: lookAt ? fromV3(lookAt) : null,
-      waypointPositions: waypoints,
-      waypointLookAts: waypointLookAts ?? new Array(waypoints.length).fill(null),
+      path,
+      arcLengths,
+      totalLength,
+      traversed: 0,
+      speed,
+      currentQuat: cam.quaternion.clone(),
+      endLookAt: endLookAt ? fromV3(endLookAt) : null,
       onComplete: onDone,
-      reverse,
+      lastTimestamp: performance.now(),
+      pathLineRef: navRef.current.pathLineRef,
     };
-    setMode("playback");
+
+    showPathLine(path);
+    setMode("navigating");
   }
 
   // ---------- Admin actions ----------
   function createShelf() {
     const id = newShelfId.trim();
-    if (!id) {
-      setStatusMsg("Enter a shelf ID.");
-      return;
-    }
+    if (!id) { setStatusMsg("Enter a shelf ID."); return; }
     if (config.shelves[id]) {
       setStatusMsg(`Shelf ${id} already exists.`);
       setActiveShelfId(id);
       return;
     }
+    const cam = cameraRef.current;
+    const pos = cam ? toV3(cam.position) : { x: 0, y: 1.6, z: 0 };
+    const dir = new THREE.Vector3();
+    cam?.getWorldDirection(dir);
+    const lookAt = cam ? toV3(cam.position.clone().add(dir.multiplyScalar(3))) : { x: 0, y: 1.6, z: -3 };
     const shelf: Shelf = {
       id,
       barcode: newShelfBarcode.trim(),
-      waypoints: [],
-      waypointLookAts: [],
-      lookAt: null,
+      cameraPosition: pos,
+      cameraLookAt: lookAt,
       panoramaUrl: null,
       panoramaYaw: 0,
       panoramaPitch: 0,
       panoramaFov: 75,
       markerYaw: null,
       markerPitch: null,
-      durationSec: 4,
-      tension: 0.5,
     };
     setConfig((c) => ({ ...c, shelves: { ...c.shelves, [id]: shelf } }));
     setActiveShelfId(id);
@@ -1140,125 +1289,44 @@ export default function App() {
     if (activeShelfId === id) setActiveShelfId(null);
   }
 
-  function addWaypoint() {
+  /** Save current camera pose as this shelf's position. */
+  function saveShelfPose() {
     const id = activeShelfIdRef.current;
-    if (!id) {
-      setStatusMsg("Select or create a shelf first.");
-      return;
-    }
+    if (!id) { setStatusMsg("Select a shelf first."); return; }
     const cam = cameraRef.current;
     if (!cam) return;
-    const wp = toV3(cam.position);
+    const pos = toV3(cam.position);
     const dir = new THREE.Vector3();
     cam.getWorldDirection(dir);
-    const lookTarget = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
+    const lookAt = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
     setConfig((c) => {
       const shelf = c.shelves[id];
       if (!shelf) return c;
       return {
         ...c,
-        shelves: {
-          ...c.shelves,
-          [id]: {
-            ...shelf,
-            waypoints: [...shelf.waypoints, wp],
-            waypointLookAts: [...(shelf.waypointLookAts ?? []), lookTarget],
-          },
-        },
+        shelves: { ...c.shelves, [id]: { ...shelf, cameraPosition: pos, cameraLookAt: lookAt } },
       };
     });
-    setStatusMsg(`Waypoint added at (${wp.x.toFixed(2)}, ${wp.y.toFixed(2)}, ${wp.z.toFixed(2)}).`);
+    setStatusMsg(`Shelf "${id}" pose saved.`);
   }
-  // keep ref synced for keyboard shortcut
-  addWaypointRef.current = addWaypoint;
+  // keep addWaypointRef compat (now saves shelf pose)
+  addWaypointRef.current = saveShelfPose;
 
-  function removeLastWaypoint() {
-    if (!activeShelfId) return;
-    setConfig((c) => {
-      const shelf = c.shelves[activeShelfId];
-      if (!shelf) return c;
-      return {
-        ...c,
-        shelves: {
-          ...c.shelves,
-          [activeShelfId]: {
-            ...shelf,
-            waypoints: shelf.waypoints.slice(0, -1),
-            waypointLookAts: (shelf.waypointLookAts ?? []).slice(0, -1),
-          },
-        },
-      };
-    });
-  }
-
-  function clearWaypoints() {
-    if (!activeShelfId) return;
-    setConfig((c) => {
-      const shelf = c.shelves[activeShelfId];
-      if (!shelf) return c;
-      return {
-        ...c,
-        shelves: {
-          ...c.shelves,
-          [activeShelfId]: { ...shelf, waypoints: [], waypointLookAts: [] },
-        },
-      };
-    });
-  }
-
-  function deleteWaypointAt(shelfId: string, index: number) {
-    setConfig((c) => {
-      const shelf = c.shelves[shelfId];
-      if (!shelf) return c;
-      return {
-        ...c,
-        shelves: {
-          ...c.shelves,
-          [shelfId]: {
-            ...shelf,
-            waypoints: shelf.waypoints.filter((_, i) => i !== index),
-            waypointLookAts: (shelf.waypointLookAts ?? []).filter((_, i) => i !== index),
-          },
-        },
-      };
-    });
-  }
-
-  function setWaypointLookAtAtIndex(shelfId: string, index: number) {
-    const cam = cameraRef.current;
-    if (!cam) return;
-    const dir = new THREE.Vector3();
-    cam.getWorldDirection(dir);
-    const lookTarget = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
-    setConfig((c) => {
-      const shelf = c.shelves[shelfId];
-      if (!shelf) return c;
-      const newLookAts = [...(shelf.waypointLookAts ?? new Array(shelf.waypoints.length).fill(null))];
-      newLookAts[index] = lookTarget;
-      return {
-        ...c,
-        shelves: { ...c.shelves, [shelfId]: { ...shelf, waypointLookAts: newLookAts } },
-      };
-    });
-    setStatusMsg(`Waypoint ${index + 1} look direction set.`);
-  }
-
-  function teleportToWaypoint(shelfId: string, index: number) {
+  function teleportToShelf(shelfId: string) {
     const shelf = config.shelves[shelfId];
-    if (!shelf) return;
-    const wp = shelf.waypoints[index];
-    const la = (shelf.waypointLookAts ?? [])[index];
-    if (!wp) return;
+    if (!shelf?.cameraPosition) return;
     const cam = cameraRef.current;
     if (!cam) return;
-    cam.position.set(wp.x, wp.y, wp.z);
-    if (la) {
-      const dir = new THREE.Vector3().subVectors(fromV3(la), fromV3(wp)).normalize();
+    cam.position.set(shelf.cameraPosition.x, shelf.cameraPosition.y, shelf.cameraPosition.z);
+    if (shelf.cameraLookAt) {
+      const dir = new THREE.Vector3()
+        .subVectors(fromV3(shelf.cameraLookAt), fromV3(shelf.cameraPosition))
+        .normalize();
       yawRef.current = Math.atan2(-dir.x, -dir.z);
       pitchRef.current = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      applyCameraRotation();
     }
-    applyCameraRotation();
-    setStatusMsg(`Teleported to waypoint ${index + 1}.`);
+    setStatusMsg(`Teleported to shelf "${shelfId}".`);
   }
 
   function duplicateShelf(id: string) {
@@ -1266,16 +1334,8 @@ export default function App() {
     if (!shelf) return;
     let newId = `${id}_copy`;
     let attempt = 1;
-    while (config.shelves[newId]) {
-      newId = `${id}_copy${attempt++}`;
-    }
-    const copy: Shelf = {
-      ...shelf,
-      id: newId,
-      waypoints: shelf.waypoints.map((w) => ({ ...w })),
-      waypointLookAts: (shelf.waypointLookAts ?? []).map((la) => (la ? { ...la } : null)),
-    };
-    setConfig((c) => ({ ...c, shelves: { ...c.shelves, [newId]: copy } }));
+    while (config.shelves[newId]) newId = `${id}_copy${attempt++}`;
+    setConfig((c) => ({ ...c, shelves: { ...c.shelves, [newId]: { ...shelf, id: newId } } }));
     setActiveShelfId(newId);
     setStatusMsg(`Shelf duplicated as "${newId}".`);
   }
@@ -1299,29 +1359,46 @@ export default function App() {
     setStatusMsg(`Shelf updated.`);
   }
 
-  function setLookAtTarget() {
-    if (!activeShelfId) return;
+  // ---------- Path node management ----------
+  function addPathNodeAtCamera() {
     const cam = cameraRef.current;
     if (!cam) return;
-    // Cast a ray forward and use a point ~3m in front as look target
-    const dir = new THREE.Vector3();
-    cam.getWorldDirection(dir);
-    const target = cam.position.clone().add(dir.multiplyScalar(3));
-    const v = toV3(target);
-    setConfig((c) => {
-      const shelf = c.shelves[activeShelfId];
-      if (!shelf) return c;
-      return {
-        ...c,
-        shelves: {
-          ...c.shelves,
-          [activeShelfId]: { ...shelf, lookAt: v },
-        },
-      };
-    });
-    setStatusMsg(`LookAt set to (${v.x.toFixed(2)}, ${v.y.toFixed(2)}, ${v.z.toFixed(2)}).`);
+    const pos = toV3(cam.position);
+    const id = newNodeIdRef.current;
+    newNodeIdRef.current = `n${parseInt(newNodeIdRef.current.slice(1), 10) + 1}`;
+    const node: PathNode = { id, position: pos, links: [] };
+    setConfig((c) => ({
+      ...c,
+      pathNodes: { ...c.pathNodes, [id]: node },
+      homeNodeId: c.homeNodeId ?? id,
+    }));
+    setStatusMsg(`Node "${id}" placed at (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}).`);
+    return id;
   }
 
+  function deletePathNode(id: string) {
+    setConfig((c) => {
+      const next = { ...c.pathNodes };
+      delete next[id];
+      // Remove links pointing to this node
+      for (const nid of Object.keys(next)) {
+        next[nid] = { ...next[nid], links: next[nid].links.filter((l) => l !== id) };
+      }
+      return {
+        ...c,
+        pathNodes: next,
+        homeNodeId: c.homeNodeId === id ? null : c.homeNodeId,
+      };
+    });
+    setStatusMsg(`Node "${id}" deleted.`);
+  }
+
+  function setHomeNode(id: string) {
+    setConfig((c) => ({ ...c, homeNodeId: id }));
+    setStatusMsg(`Home node set to "${id}".`);
+  }
+
+  // ---------- Home helpers ----------
   function setHomeFromCamera() {
     const cam = cameraRef.current;
     if (!cam) return;
@@ -1338,9 +1415,8 @@ export default function App() {
     if (!cam) return;
     const from = toV3(cam.position);
     const to = config.homePosition;
-    const dist = Math.hypot(from.x - to.x, from.y - to.y, from.z - to.z);
+    const dist = v3dist(from, to);
     if (dist < 0.05) {
-      // Already there: just face the home lookAt
       const dir = new THREE.Vector3()
         .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
         .normalize();
@@ -1349,16 +1425,8 @@ export default function App() {
       applyCameraRotation();
       return;
     }
-    startPlayback(
-      [from, to],
-      config.homeLookAt,
-      () => {
-        setMode("admin-free");
-      },
-      false,
-      Math.max(1.5, Math.min(5, dist * 0.4)),
-      0.5,
-    );
+    startNavigation(to, config.homeLookAt, () => setMode("admin-free"),
+      null, config.homeNodeId ?? null);
   }
 
   // ---------- File handling ----------
@@ -1617,7 +1685,7 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  // ---------- Runtime: run path to shelf ----------
+  // ---------- Runtime: navigate to shelf via path graph ----------
   function runRuntime(query: string) {
     const q = query.trim().toLowerCase();
     if (!q) return;
@@ -1628,36 +1696,26 @@ export default function App() {
       setStatusMsg(`No shelf found for "${query}".`);
       return;
     }
-    if (match.waypoints.length < 2) {
-      setStatusMsg(`Shelf ${match.id} has fewer than 2 waypoints.`);
+    if (!match.cameraPosition) {
+      setStatusMsg(`Shelf "${match.id}" has no saved camera position yet.`);
       return;
     }
     setActiveShelfId(match.id);
-    // Build path: from current camera position -> waypoints (no teleport)
-    const fullPath: Vec3[] = [];
-    fullPath.push(toV3(cameraRef.current!.position));
-    fullPath.push(...match.waypoints);
-    const fullLookAts: (Vec3 | null)[] = [null, ...(match.waypointLookAts ?? new Array(match.waypoints.length).fill(null))];
-    startPlayback(
-      fullPath,
-      match.lookAt,
+    startNavigation(
+      match.cameraPosition,
+      match.cameraLookAt ?? null,
       () => {
         if (match.panoramaUrl) {
           enterPanorama(match);
         } else {
           setMode("admin-free");
-          setStatusMsg(`Arrived at ${match.id}. No panorama assigned.`);
+          setStatusMsg(`Arrived at ${match.id}.`);
         }
       },
-      false,
-      match.durationSec,
-      match.tension,
-      fullLookAts,
     );
   }
 
   function returnHome() {
-    const shelf = activeShelfId ? config.shelves[activeShelfId] : null;
     const wasPano =
       modeRef.current === "panorama" || modeRef.current === "admin-pano-edit";
     const cam = cameraRef.current;
@@ -1670,45 +1728,13 @@ export default function App() {
       return;
     }
     if (wasPano) {
-      // Fade out panorama, then exit & glide home
       runFade(() => {
         setMode("admin-free");
-        beginReturnHome(shelf);
+        gotoHome();
       });
     } else {
-      beginReturnHome(shelf);
-    }
-  }
-
-  function beginReturnHome(shelf: Shelf | null) {
-    const cam = cameraRef.current!;
-    if (!shelf || shelf.waypoints.length < 2) {
       gotoHome();
-      return;
     }
-    // Reverse path starting at the camera's current position so there is no teleport
-    const reversePath: Vec3[] = [
-      toV3(cam.position),
-      ...[...shelf.waypoints].reverse(),
-      config.homePosition,
-    ];
-    const reverseLookAts: (Vec3 | null)[] = [
-      null,
-      ...[...(shelf.waypointLookAts ?? new Array(shelf.waypoints.length).fill(null))].reverse(),
-      null,
-    ];
-    startPlayback(
-      reversePath,
-      config.homeLookAt,
-      () => {
-        setMode("admin-free");
-        setStatusMsg("Returned home.");
-      },
-      false,
-      shelf.durationSec,
-      shelf.tension,
-      reverseLookAts,
-    );
   }
 
   // Quick fade-to-black overlay that runs `cb` at peak black
@@ -2044,14 +2070,6 @@ export default function App() {
     setStatusMsg("Rotation preset saved.");
   }
 
-  function startPathEdit() {
-    if (!activeShelfId) {
-      setStatusMsg("Select or create a shelf first.");
-      return;
-    }
-    setMode("admin-path-edit");
-  }
-
   function startPanoEdit() {
     if (!activeShelfId) {
       setStatusMsg("Select or create a shelf first.");
@@ -2203,17 +2221,16 @@ export default function App() {
               deleteShelf={deleteShelf}
               duplicateShelf={duplicateShelf}
               renameShelf={renameShelf}
-              addWaypoint={addWaypoint}
-              removeLastWaypoint={removeLastWaypoint}
-              clearWaypoints={clearWaypoints}
-              deleteWaypointAt={deleteWaypointAt}
-              setWaypointLookAtAtIndex={setWaypointLookAtAtIndex}
-              teleportToWaypoint={teleportToWaypoint}
-              setLookAtTarget={setLookAtTarget}
+              saveShelfPose={saveShelfPose}
+              teleportToShelf={teleportToShelf}
+              addPathNodeAtCamera={addPathNodeAtCamera}
+              deletePathNode={deletePathNode}
+              setHomeNode={setHomeNode}
               setHomeFromCamera={setHomeFromCamera}
               gotoHome={gotoHome}
-              startPathEdit={startPathEdit}
               startPanoEdit={startPanoEdit}
+              showNodeGraph={showNodeGraph}
+              setShowNodeGraph={setShowNodeGraph}
               setRotationPreset={setRotationPreset}
               onGlbUpload={onGlbUpload}
               onPanoUpload={onPanoUpload}
@@ -2260,7 +2277,7 @@ export default function App() {
 
         <div className="panel" style={{ pointerEvents: "auto", maxWidth: 320 }}>
           <h3>Controls</h3>
-          {mode === "admin-free" || mode === "admin-path-edit" ? (
+          {mode === "admin-free" || mode === "admin-node-edit" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
               Right-click drag = look (mouse wraps at edges) · WASD = move ·
               Q/E = down/up · Shift = sprint · Wheel = FOV · Left-click = select
@@ -2322,8 +2339,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Center crosshair in path-edit mode */}
-      {(mode === "admin-free" || mode === "admin-path-edit") && (
+      {/* Center crosshair in admin 3D modes */}
+      {(mode === "admin-free" || mode === "admin-node-edit") && (
         <div
           style={{
             position: "absolute",
@@ -2337,6 +2354,53 @@ export default function App() {
             pointerEvents: "none",
           }}
         />
+      )}
+
+      {/* Node Graph Editor overlay */}
+      {showNodeGraph && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.75)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 200,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowNodeGraph(false); }}
+        >
+          <NodeGraphView
+            nodes={config.pathNodes}
+            homeNodeId={config.homeNodeId}
+            onClose={() => setShowNodeGraph(false)}
+            onAddLink={(fromId, toId) =>
+              setConfig((c) => {
+                const nodes = { ...c.pathNodes };
+                const from = nodes[fromId];
+                const to = nodes[toId];
+                if (!from || !to) return c;
+                const fl = from.links.includes(toId) ? from.links : [...from.links, toId];
+                const tl = to.links.includes(fromId) ? to.links : [...to.links, fromId];
+                nodes[fromId] = { ...from, links: fl };
+                nodes[toId] = { ...to, links: tl };
+                return { ...c, pathNodes: nodes };
+              })
+            }
+            onRemoveLink={(fromId, toId) =>
+              setConfig((c) => {
+                const nodes = { ...c.pathNodes };
+                const from = nodes[fromId];
+                const to = nodes[toId];
+                if (from) nodes[fromId] = { ...from, links: from.links.filter((l) => l !== toId) };
+                if (to) nodes[toId] = { ...to, links: to.links.filter((l) => l !== fromId) };
+                return { ...c, pathNodes: nodes };
+              })
+            }
+            onRemoveNode={deletePathNode}
+            onSetHomeNode={setHomeNode}
+          />
+        </div>
       )}
 
       {/* Admin password modal */}
@@ -2396,17 +2460,16 @@ function AdminPanel(props: {
   deleteShelf: (id: string) => void;
   duplicateShelf: (id: string) => void;
   renameShelf: (oldId: string, newId: string, barcode: string) => void;
-  addWaypoint: () => void;
-  removeLastWaypoint: () => void;
-  clearWaypoints: () => void;
-  deleteWaypointAt: (shelfId: string, index: number) => void;
-  setWaypointLookAtAtIndex: (shelfId: string, index: number) => void;
-  teleportToWaypoint: (shelfId: string, index: number) => void;
-  setLookAtTarget: () => void;
+  saveShelfPose: () => void;
+  teleportToShelf: (shelfId: string) => void;
+  addPathNodeAtCamera: () => void;
+  deletePathNode: (id: string) => void;
+  setHomeNode: (id: string) => void;
   setHomeFromCamera: () => void;
   gotoHome: () => void;
-  startPathEdit: () => void;
   startPanoEdit: () => void;
+  showNodeGraph: boolean;
+  setShowNodeGraph: (v: boolean) => void;
   setRotationPreset: () => void;
   onGlbUpload: (f: File) => void;
   onPanoUpload: (f: File) => void;
@@ -2450,17 +2513,16 @@ function AdminPanel(props: {
     deleteShelf,
     duplicateShelf,
     renameShelf,
-    addWaypoint,
-    removeLastWaypoint,
-    clearWaypoints,
-    deleteWaypointAt,
-    setWaypointLookAtAtIndex,
-    teleportToWaypoint,
-    setLookAtTarget,
+    saveShelfPose,
+    teleportToShelf,
+    addPathNodeAtCamera,
+    deletePathNode,
+    setHomeNode,
     setHomeFromCamera,
     gotoHome,
-    startPathEdit,
     startPanoEdit,
+    showNodeGraph,
+    setShowNodeGraph,
     setRotationPreset,
     onGlbUpload,
     onPanoUpload,
@@ -2536,6 +2598,28 @@ function AdminPanel(props: {
         <span className="muted" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {config.glbUrl ? "Loaded" : "No model"}
         </span>
+      </div>
+
+      {/* Gaussian splat URL */}
+      <div style={{ marginTop: 6 }}>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>Gaussian Splat URL (.ksplat / .splat)</div>
+        <div className="row" style={{ gap: 4 }}>
+          <input
+            style={{ flex: 1, fontSize: 11 }}
+            placeholder="https://…/scene.ksplat"
+            value={config.splatUrl ?? ""}
+            onChange={(e) =>
+              setConfig((c) => ({ ...c, splatUrl: e.target.value || null }))
+            }
+          />
+          {config.splatUrl && (
+            <button
+              style={{ fontSize: 11, padding: "3px 7px" }}
+              className="danger"
+              onClick={() => setConfig((c) => ({ ...c, splatUrl: null }))}
+            >✕</button>
+          )}
+        </div>
       </div>
 
       <div className="divider" />
@@ -2645,6 +2729,58 @@ function AdminPanel(props: {
 
       <div className="divider" />
 
+      <h4>Path Nodes ({Object.keys(config.pathNodes).length})</h4>
+      <div className="col" style={{ gap: 4 }}>
+        <div className="row">
+          <button onClick={addPathNodeAtCamera}>+ Place Node Here</button>
+          <button onClick={() => setShowNodeGraph(true)}>Edit Graph</button>
+        </div>
+        <div className="muted" style={{ fontSize: 11 }}>
+          Home node: {config.homeNodeId ?? "none"}
+        </div>
+        {/* Speed slider */}
+        <label className="muted" style={{ display: "block" }}>
+          Travel speed: {config.cameraSpeed.toFixed(1)} u/s
+          <input
+            type="range"
+            min={0.5}
+            max={15}
+            step={0.5}
+            value={config.cameraSpeed}
+            onChange={(e) =>
+              setConfig((c) => ({ ...c, cameraSpeed: parseFloat(e.target.value) }))
+            }
+            style={{ width: "100%" }}
+          />
+        </label>
+        {/* Node list */}
+        {Object.values(config.pathNodes).length > 0 && (
+          <div className="col" style={{ gap: 2, maxHeight: 120, overflowY: "auto" }}>
+            {Object.values(config.pathNodes).map((n) => (
+              <div key={n.id} className="row" style={{ gap: 4, fontSize: 11 }}>
+                <span style={{ flex: 1, fontFamily: "monospace" }}>
+                  {n.id === config.homeNodeId ? "⌂ " : ""}{n.id}
+                  {" "}({n.position.x.toFixed(1)},{n.position.y.toFixed(1)},{n.position.z.toFixed(1)})
+                  {" · "}{n.links.length} links
+                </span>
+                <button
+                  style={{ fontSize: 10, padding: "2px 5px" }}
+                  onClick={() => setHomeNode(n.id)}
+                  title="Set as home node"
+                >⌂</button>
+                <button
+                  style={{ fontSize: 10, padding: "2px 5px" }}
+                  className="danger"
+                  onClick={() => deletePathNode(n.id)}
+                >✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="divider" />
+
       <h4>Shelves</h4>
       <div className="col">
         <input
@@ -2686,11 +2822,10 @@ function AdminPanel(props: {
 
           <div className="row">
             <button
-              className={mode === "admin-path-edit" ? "primary" : ""}
-              onClick={startPathEdit}
-              disabled={!config.glbUrl && shelfList.length === 0}
+              className={mode === "admin-node-edit" ? "primary" : ""}
+              onClick={() => setMode("admin-node-edit")}
             >
-              3D Path Editor
+              3D Editor
             </button>
             <button
               className={mode === "admin-pano-edit" ? "primary" : ""}
@@ -2728,61 +2863,23 @@ function AdminPanel(props: {
             )}
           </div>
 
-          {(mode === "admin-path-edit" || mode === "admin-free") && (
+          {(mode === "admin-node-edit" || mode === "admin-free") && (
             <div className="col">
-              <h4>Path Tools</h4>
+              <h4>Shelf Pose</h4>
               <div className="row">
-                <button onClick={addWaypoint}>+ Waypoint</button>
-                <button onClick={removeLastWaypoint} disabled={!activeShelf.waypoints.length}>
-                  Undo
-                </button>
+                <button onClick={saveShelfPose}>Save Camera Here [M]</button>
                 <button
-                  className="danger"
-                  onClick={clearWaypoints}
-                  disabled={!activeShelf.waypoints.length}
+                  disabled={!activeShelf.cameraPosition}
+                  onClick={() => teleportToShelf(activeShelfId!)}
                 >
-                  Clear
+                  Teleport
                 </button>
               </div>
-              <button onClick={setLookAtTarget}>Set Final LookAt</button>
               <div className="muted" style={{ fontSize: 11 }}>
-                LookAt: {activeShelf.lookAt ? "set" : "—"}
+                {activeShelf.cameraPosition
+                  ? `Pos: (${activeShelf.cameraPosition.x.toFixed(1)}, ${activeShelf.cameraPosition.y.toFixed(1)}, ${activeShelf.cameraPosition.z.toFixed(1)})`
+                  : "No pose saved yet"}
               </div>
-
-              {/* Waypoint list */}
-              {activeShelf.waypoints.length > 0 && (
-                <div className="col" style={{ gap: 3, marginTop: 4 }}>
-                  <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>Waypoints (click to teleport)</div>
-                  {activeShelf.waypoints.map((wp, i) => {
-                    const la = (activeShelf.waypointLookAts ?? [])[i];
-                    return (
-                      <div key={i} className="row" style={{ gap: 4, fontSize: 11, alignItems: "center" }}>
-                        <button
-                          style={{ flex: 1, fontSize: 10, padding: "3px 5px", textAlign: "left" }}
-                          onClick={() => teleportToWaypoint(activeShelfId!, i)}
-                        >
-                          {i + 1}. ({wp.x.toFixed(1)}, {wp.y.toFixed(1)}, {wp.z.toFixed(1)})
-                          {la ? " 👁" : ""}
-                        </button>
-                        <button
-                          title="Set look direction for this waypoint from current camera"
-                          style={{ fontSize: 10, padding: "3px 5px" }}
-                          onClick={() => setWaypointLookAtAtIndex(activeShelfId!, i)}
-                        >
-                          Look
-                        </button>
-                        <button
-                          className="danger"
-                          style={{ fontSize: 10, padding: "3px 5px" }}
-                          onClick={() => deleteWaypointAt(activeShelfId!, i)}
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           )}
 
@@ -2823,60 +2920,6 @@ function AdminPanel(props: {
               <button onClick={() => setMode("admin-free")}>← Back to 3D</button>
             </div>
           )}
-
-          <div className="col">
-            <h4>Path Tuning</h4>
-            <label className="muted" style={{ display: "block" }}>
-              Duration: {activeShelf.durationSec.toFixed(1)}s
-              <input
-                type="range"
-                min={1}
-                max={15}
-                step={0.5}
-                value={activeShelf.durationSec}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  setConfig((c) => {
-                    const s = c.shelves[activeShelf.id];
-                    if (!s) return c;
-                    return {
-                      ...c,
-                      shelves: {
-                        ...c.shelves,
-                        [activeShelf.id]: { ...s, durationSec: v },
-                      },
-                    };
-                  });
-                }}
-                style={{ width: "100%" }}
-              />
-            </label>
-            <label className="muted" style={{ display: "block" }}>
-              Curve tension: {activeShelf.tension.toFixed(2)}
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={activeShelf.tension}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  setConfig((c) => {
-                    const s = c.shelves[activeShelf.id];
-                    if (!s) return c;
-                    return {
-                      ...c,
-                      shelves: {
-                        ...c.shelves,
-                        [activeShelf.id]: { ...s, tension: v },
-                      },
-                    };
-                  });
-                }}
-                style={{ width: "100%" }}
-              />
-            </label>
-          </div>
 
           <button
             className="danger"
@@ -3107,7 +3150,7 @@ function RuntimePanel(props: {
           onChange={(e) => setQuery(e.target.value)}
           autoFocus
         />
-        <button className="primary" type="submit" disabled={mode === "playback"}>
+        <button className="primary" type="submit" disabled={mode === "navigating"}>
           Go
         </button>
       </form>
@@ -3123,12 +3166,8 @@ function RuntimePanel(props: {
               <button
                 key={s.id}
                 onClick={() => run(s.id)}
-                disabled={mode === "playback" || s.waypoints.length < 2}
-                title={
-                  s.waypoints.length < 2
-                    ? "Needs ≥ 2 waypoints"
-                    : `${s.waypoints.length} waypoints`
-                }
+                disabled={mode === "navigating" || !s.cameraPosition}
+                title={!s.cameraPosition ? "No pose saved" : `Go to ${s.id}`}
               >
                 {s.id}
               </button>
@@ -3138,7 +3177,7 @@ function RuntimePanel(props: {
       )}
 
       <div className="divider" />
-      <button onClick={returnHome} disabled={mode === "playback"}>
+      <button onClick={returnHome} disabled={mode === "navigating"}>
         ← Return Home
       </button>
     </div>

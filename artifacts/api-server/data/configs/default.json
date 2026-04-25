@@ -30,6 +30,25 @@
   },
   "shelves": {
     "rack room": {
+      "durationSec": 7,
+      "tension": 0.5,
+      "waypointLookAts": [
+        {
+          "x": -7.735265609290717,
+          "y": -0.2351483502344826,
+          "z": -12.01646346623818
+        },
+        {
+          "x": -8.264020320758316,
+          "y": -0.4187793779596997,
+          "z": -14.074085731838107
+        },
+        {
+          "x": -8.408913621925041,
+          "y": -0.4343337678997694,
+          "z": -15.006204523934587
+        }
+      ],
       "id": "rack room",
       "barcode": "",
       "waypoints": [
@@ -59,9 +78,7 @@
       "panoramaPitch": 0,
       "panoramaFov": 75,
       "markerYaw": null,
-      "markerPitch": null,
-      "durationSec": 4,
-      "tension": 0.5
+      "markerPitch": null
     }
   }
 }
