@@ -12,9 +12,6 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /**
-   * Load configs on startup
-   */
   useEffect(() => {
     async function loadConfigs() {
       try {
@@ -40,9 +37,6 @@ export default function App() {
     loadConfigs();
   }, []);
 
-  /**
-   * Upload GLB file
-   */
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -70,15 +64,12 @@ export default function App() {
         throw new Error(data.error || "Upload failed");
       }
 
-      console.log("Upload success:", data);
-
-      // OPTIONAL: reload configs after upload
       const configRes = await fetch("/api/configs");
+
       if (configRes.ok) {
         const newConfigs = await configRes.json();
         setConfigs(newConfigs);
       }
-
     } catch (err: any) {
       console.error("Upload error:", err);
       setError(err.message || "Upload failed");
@@ -91,7 +82,6 @@ export default function App() {
     <div style={{ padding: 20, fontFamily: "sans-serif" }}>
       <h1>Warehouse NAV</h1>
 
-      {/* Upload */}
       <div style={{ marginBottom: 20 }}>
         <input
           type="file"
@@ -102,14 +92,12 @@ export default function App() {
         {uploading && <p>Uploading...</p>}
       </div>
 
-      {/* Errors */}
       {error && (
         <div style={{ color: "red", marginBottom: 20 }}>
           Error: {error}
         </div>
       )}
 
-      {/* Loading */}
       {loading ? (
         <p>Loading configs...</p>
       ) : (
