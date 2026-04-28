@@ -18,6 +18,7 @@ const PHOTO_DIR = path.join(DATA_DIR, "photos");
 
 /**
  * STORAGE CONFIG
+ * IMPORTANT: keep original filenames (NO timestamp prefix)
  */
 const storage = multer.diskStorage({
   destination: (_req, file, cb) => {
@@ -30,8 +31,8 @@ const storage = multer.diskStorage({
     }
   },
   filename: (_req, file, cb) => {
-    const name = `${Date.now()}_${file.originalname}`;
-    cb(null, name);
+    // KEEP ORIGINAL NAME (this fixes your 404 issue)
+    cb(null, file.originalname);
   },
 });
 
@@ -73,12 +74,17 @@ router.get("/files/glbs/:file", (req, res) => {
  * LIST GLB FILES
  */
 router.get("/files/glbs", (_req, res) => {
-  const files = fs.readdirSync(GLB_DIR);
-  return res.json(files);
+  try {
+    const files = fs.readdirSync(GLB_DIR);
+    return res.json(files);
+  } catch (err) {
+    logger.error({ err }, "Failed to read GLB directory");
+    return res.status(500).json({ error: "Failed to list GLBs" });
+  }
 });
 
 /**
- * CONFIG LIST (THIS FIXES YOUR DROPDOWN)
+ * LIST CONFIG FILES (fixes dropdown)
  */
 router.get("/configs", (_req, res) => {
   try {
