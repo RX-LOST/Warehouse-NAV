@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,15 +11,10 @@ const GLB_DIR = path.join(DATA_DIR, "glbs");
 const CONFIG_DIR = path.join(DATA_DIR, "configs");
 const PHOTO_DIR = path.join(DATA_DIR, "photos");
 
-// Ensure directories exist
 [DATA_DIR, GLB_DIR, CONFIG_DIR, PHOTO_DIR].forEach((dir) => {
   fs.mkdirSync(dir, { recursive: true });
 });
 
-/**
- * STORAGE CONFIG
- * IMPORTANT: keep original filenames (NO timestamp prefix)
- */
 const storage = multer.diskStorage({
   destination: (_req, file, cb) => {
     if (file.originalname.endsWith(".glb")) {
@@ -31,7 +26,6 @@ const storage = multer.diskStorage({
     }
   },
   filename: (_req, file, cb) => {
-    // KEEP ORIGINAL NAME (this fixes your 404 issue)
     cb(null, file.originalname);
   },
 });
@@ -39,14 +33,11 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 512 * 1024 * 1024,
+    fileSize: 512 * 1024 * 512,
   },
 });
 
-/**
- * UPLOAD
- */
-router.post("/upload", upload.single("file"), (req, res) => {
+function handleUpload(req: Request, res: Response) {
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" });
   }
@@ -55,11 +46,12 @@ router.post("/upload", upload.single("file"), (req, res) => {
     success: true,
     filename: req.file.filename,
   });
-});
+}
 
-/**
- * SERVE GLB FILE
- */
+router.post("/upload", upload.single("file"), handleUpload);
+router.post("/upload/glb", upload.single("file"), handleUpload);
+router.post("/upload/photo", upload.single("file"), handleUpload);
+
 router.get("/files/glbs/:file", (req, res) => {
   const filePath = path.join(GLB_DIR, req.params.file);
 
@@ -70,9 +62,6 @@ router.get("/files/glbs/:file", (req, res) => {
   return res.sendFile(filePath);
 });
 
-/**
- * LIST GLB FILES
- */
 router.get("/files/glbs", (_req, res) => {
   try {
     const files = fs.readdirSync(GLB_DIR);
@@ -83,9 +72,6 @@ router.get("/files/glbs", (_req, res) => {
   }
 });
 
-/**
- * LIST CONFIG FILES (fixes dropdown)
- */
 router.get("/configs", (_req, res) => {
   try {
     const files = fs.readdirSync(CONFIG_DIR);
@@ -96,9 +82,6 @@ router.get("/configs", (_req, res) => {
   }
 });
 
-/**
- * GET CONFIG FILE
- */
 router.get("/configs/:file", (req, res) => {
   const filePath = path.join(CONFIG_DIR, req.params.file);
 
