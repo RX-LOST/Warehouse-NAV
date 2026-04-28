@@ -13,13 +13,18 @@ const dirs = {
 };
 
 Object.values(dirs).forEach((dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 });
 
 const storage = multer.diskStorage({
   destination: (_req, file, cb) => {
-    if (file.fieldname === "glb") cb(null, dirs.glbs);
-    else cb(null, dirs.photos);
+    if (file.fieldname === "glb") {
+      cb(null, dirs.glbs);
+    } else {
+      cb(null, dirs.photos);
+    }
   },
   filename: (_req, file, cb) => {
     const unique = `${Date.now()}-${file.originalname}`;
@@ -29,13 +34,12 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-/**
- * Upload GLB
- */
 router.post("/upload/glb", upload.single("glb"), (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ success: false, error: "No file uploaded" });
+      return res
+        .status(400)
+        .json({ success: false, error: "No file uploaded" });
     }
 
     return res.json({
@@ -45,13 +49,12 @@ router.post("/upload/glb", upload.single("glb"), (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ success: false, error: "Upload failed" });
+    return res
+      .status(500)
+      .json({ success: false, error: "Upload failed" });
   }
 });
 
-/**
- * Serve files
- */
 router.get("/files/glbs/:name", (req, res) => {
   const filePath = path.join(dirs.glbs, req.params.name);
 
@@ -59,7 +62,7 @@ router.get("/files/glbs/:name", (req, res) => {
     return res.status(404).send("Not found");
   }
 
-  res.sendFile(filePath);
+  return res.sendFile(filePath);
 });
 
 export default router;
