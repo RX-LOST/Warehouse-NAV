@@ -6,7 +6,7 @@ RELEASE_URL="https://github.com/RX-LOST/Warehouse-NAV/releases/latest/download/b
 
 echo "=== Updating system ==="
 sudo apt update
-sudo apt install -y curl tar
+sudo apt install -y curl tar git
 
 echo "=== Installing Node.js (NodeSource) ==="
 if ! command -v node &> /dev/null; then
@@ -18,58 +18,58 @@ echo "Node version:"
 node -v
 npm -v
 
-echo "=== Installing pnpm ==="
-if ! command -v pnpm &> /dev/null; then
-  npm install -g pnpm
-fi
+echo "=== Installing pnpm (COREPACK recommended) ==="
+corepack enable
+corepack prepare pnpm@latest --activate
+
+pnpm -v
 
 echo "=== Preparing directory ==="
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
 echo "=== Cleaning old deployment (SAFE) ==="
-find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "data" -exec rm -rf {} +
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "artifacts" ! -name "data" -exec rm -rf {} +
 
 echo "=== Downloading release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
 echo "=== Extracting ==="
 tar -xzf build.tar.gz
-rm -f build.tar.gz
+rm build.tar.gz
 
-echo "=== Finding pnpm workspace root ==="
-
-# Find the REAL workspace root (must contain pnpm-workspace.yaml OR root package.json with workspace deps)
-ROOT_DIR=$(find "$APP_DIR" -name "pnpm-workspace.yaml" -type f 2>/dev/null | head -n 1 | xargs dirname || true)
-
-# fallback if workspace file not found
-if [ -z "$ROOT_DIR" ]; then
-  ROOT_DIR=$(find "$APP_DIR" -name package.json -not -path "*/node_modules/*" \
-    -exec grep -l '"@workspace/' {} \; \
-    | head -n 1 | xargs dirname)
+echo "=== Finding workspace root ==="
+# If repo extracted into artifacts folder, go there
+if [ -d "$APP_DIR/artifacts" ]; then
+  cd "$APP_DIR/artifacts/mockup-sandbox" || cd "$APP_DIR/artifacts/api-server"
+else
+  cd "$APP_DIR"
 fi
 
-if [ -z "$ROOT_DIR" ]; then
-  echo "❌ ERROR: Could not find workspace root"
-  echo "Dumping structure for debugging:"
-  find "$APP_DIR" -maxdepth 4 -name package.json
-  exit 1
-fi
+echo "Workspace root: $(pwd)"
 
-echo "Detected workspace root: $ROOT_DIR"
-
-cd "$ROOT_DIR"
-
-echo "=== Enabling pnpm environment ==="
-export CI=true
-export PNPM_HOME="$HOME/.local/share/pnpm"
+echo "=== Enabling pnpm workspace mode ==="
+export PNPM_HOME="$HOME/.pnpm"
 export PATH="$PNPM_HOME:$PATH"
 
-echo "=== Installing dependencies (workspace mode) ==="
-pnpm install --frozen-lockfile || pnpm install
+pnpm config set auto-install-peers true
+pnpm config set strict-peer-dependencies false
 
-echo "=== Building workspace ==="
-pnpm run build || true
+echo "=== Installing dependencies (WORKSPACE ROOT FIXED) ==="
 
-echo "=== Starting API server ==="
-exec pnpm --filter @workspace/api-server start
+# IMPORTANT FIX:
+pnpm install --no-frozen-lockfile --recursive
+
+echo "=== Building (if needed) ==="
+if [ -f "package.json" ]; then
+  pnpm run build || true
+fi
+
+echo "=== Starting server ==="
+
+cd "$APP_DIR/artifacts/api-server" 2>/dev/null || true
+
+export HOST=0.0.0.0
+export PORT=3000
+
+node dist/index.js || node index.js
