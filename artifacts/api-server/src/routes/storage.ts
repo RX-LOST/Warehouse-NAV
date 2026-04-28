@@ -1,65 +1,103 @@
 import { Router } from "express";
 import multer from "multer";
-import path from "node:path";
 import fs from "node:fs";
+import path from "node:path";
+import { logger } from "../lib/logger";
 
 const router = Router();
 
 const DATA_DIR = path.resolve(process.cwd(), "data");
+const GLB_DIR = path.join(DATA_DIR, "glbs");
+const CONFIG_DIR = path.join(DATA_DIR, "configs");
+const PHOTO_DIR = path.join(DATA_DIR, "photos");
 
-const dirs = {
-  glbs: path.join(DATA_DIR, "glbs"),
-  photos: path.join(DATA_DIR, "photos"),
-};
-
-Object.values(dirs).forEach((dir) => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+// Ensure directories exist
+[DATA_DIR, GLB_DIR, CONFIG_DIR, PHOTO_DIR].forEach((dir) => {
+  fs.mkdirSync(dir, { recursive: true });
 });
 
+/**
+ * STORAGE CONFIG
+ */
 const storage = multer.diskStorage({
   destination: (_req, file, cb) => {
-    if (file.fieldname === "glb") {
-      cb(null, dirs.glbs);
+    if (file.originalname.endsWith(".glb")) {
+      cb(null, GLB_DIR);
+    } else if (file.originalname.endsWith(".json")) {
+      cb(null, CONFIG_DIR);
     } else {
-      cb(null, dirs.photos);
+      cb(null, PHOTO_DIR);
     }
   },
   filename: (_req, file, cb) => {
-    const unique = `${Date.now()}-${file.originalname}`;
-    cb(null, unique);
+    const name = `${Date.now()}_${file.originalname}`;
+    cb(null, name);
   },
 });
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 512 * 1024 * 1024,
+  },
+});
 
-router.post("/upload/glb", upload.single("glb"), (req, res) => {
+/**
+ * UPLOAD
+ */
+router.post("/upload", upload.single("file"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file uploaded" });
+  }
+
+  return res.json({
+    success: true,
+    filename: req.file.filename,
+  });
+});
+
+/**
+ * SERVE GLB FILE
+ */
+router.get("/files/glbs/:file", (req, res) => {
+  const filePath = path.join(GLB_DIR, req.params.file);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send("File not found");
+  }
+
+  return res.sendFile(filePath);
+});
+
+/**
+ * LIST GLB FILES
+ */
+router.get("/files/glbs", (_req, res) => {
+  const files = fs.readdirSync(GLB_DIR);
+  return res.json(files);
+});
+
+/**
+ * CONFIG LIST (THIS FIXES YOUR DROPDOWN)
+ */
+router.get("/configs", (_req, res) => {
   try {
-    if (!req.file) {
-      return res
-        .status(400)
-        .json({ success: false, error: "No file uploaded" });
-    }
-
-    return res.json({
-      success: true,
-      file: req.file.filename,
-      path: `/api/files/glbs/${req.file.filename}`,
-    });
+    const files = fs.readdirSync(CONFIG_DIR);
+    return res.json(files);
   } catch (err) {
-    console.error(err);
-    return res
-      .status(500)
-      .json({ success: false, error: "Upload failed" });
+    logger.error({ err }, "Failed to read configs");
+    return res.status(500).json({ error: "Failed to read configs" });
   }
 });
 
-router.get("/files/glbs/:name", (req, res) => {
-  const filePath = path.join(dirs.glbs, req.params.name);
+/**
+ * GET CONFIG FILE
+ */
+router.get("/configs/:file", (req, res) => {
+  const filePath = path.join(CONFIG_DIR, req.params.file);
 
   if (!fs.existsSync(filePath)) {
-    return res.status(404).send("Not found");
+    return res.status(404).send("Config not found");
   }
 
   return res.sendFile(filePath);
