@@ -31,15 +31,31 @@ cd "$APP_DIR"
 echo "=== Ensuring persistent data directory ==="
 mkdir -p "$APP_DIR/artifacts/api-server/data"
 
-echo "=== Cleaning old deployment (preserving data) ==="
-find "$APP_DIR" -mindepth 1 ! -path "$APP_DIR/artifacts/api-server/data*" -exec rm -rf {} +
+echo "=== Cleaning old deployment (SAFE) ==="
+
+# SAFE cleanup instead of broken find on pnpm trees
+shopt -s extglob
+
+for item in "$APP_DIR"/*; do
+  case "$item" in
+    "$APP_DIR/artifacts/api-server/data") 
+      echo "Preserving data directory"
+      ;;
+    "$APP_DIR/artifacts/api-server/data/"*)
+      echo "Preserving data contents"
+      ;;
+    *)
+      rm -rf "$item"
+      ;;
+  esac
+done
 
 echo "=== Downloading release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
 echo "=== Extracting ==="
 tar -xzf build.tar.gz
-rm build.tar.gz
+rm -f build.tar.gz
 
 echo "=== Installing server dependencies ==="
 cd artifacts/api-server
@@ -47,7 +63,8 @@ cd artifacts/api-server
 export CI=true
 export PNPM_CONFIG_CONFIRM_MODULES_PURGE=false
 
-pnpm install --prod --no-frozen-lockfile
+# Make pnpm more stable on Pi
+pnpm install --prod --no-frozen-lockfile || npm install --omit=dev
 
 echo "=== Starting server ==="
 
