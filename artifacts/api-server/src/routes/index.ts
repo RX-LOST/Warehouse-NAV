@@ -1,12 +1,12 @@
-import { Router, type IRouter } from "express";
-import healthRouter from "./health";
-import storageRouter from "./storage";
-import authRouter from "./auth";
+import { Router } from "express";
+import storage from "./storage";
+import auth from "./auth";
+import configs from "./configs";
 
-const router: IRouter = Router();
+const router = Router();
 
-router.use(healthRouter);
-router.use(authRouter);
-router.use(storageRouter);
+router.use("/", storage);
+router.use("/", configs);
+router.use("/", auth);
 
 export default router;
