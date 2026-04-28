@@ -9,8 +9,7 @@ echo "=== Updating system ==="
 sudo apt update
 sudo apt install -y curl tar
 
-echo "=== Installing Node.js (clean NodeSource setup) ==="
-
+echo "=== Installing Node.js (NodeSource) ==="
 if ! command -v node &> /dev/null; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
   sudo apt install -y nodejs
@@ -29,6 +28,12 @@ echo "=== Preparing directory ==="
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
+echo "=== Ensuring persistent data directory ==="
+mkdir -p "$APP_DIR/artifacts/api-server/data"
+
+echo "=== Cleaning old deployment (preserving data) ==="
+find "$APP_DIR" -mindepth 1 ! -path "$APP_DIR/artifacts/api-server/data*" -exec rm -rf {} +
+
 echo "=== Downloading release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
@@ -36,8 +41,11 @@ echo "=== Extracting ==="
 tar -xzf build.tar.gz
 rm build.tar.gz
 
-echo "=== Installing server deps ==="
+echo "=== Installing server dependencies ==="
 cd artifacts/api-server
+
+export CI=true
+export PNPM_CONFIG_CONFIRM_MODULES_PURGE=false
 
 pnpm install --prod --no-frozen-lockfile
 
