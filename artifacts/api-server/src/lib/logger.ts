@@ -9,12 +9,10 @@ export const logger = pino({
     "req.headers.cookie",
     "res.headers['set-cookie']",
   ],
-  ...(isProduction
-    ? {}
-    : {
-        transport: {
-          target: "pino-pretty",
-          options: { colorize: true },
-        },
-      }),
+
+  // 🚨 IMPORTANT: disable transports completely on Pi
+  // pino-pretty uses worker threads → causes crash
+  transport: isProduction
+    ? undefined
+    : undefined,
 });
