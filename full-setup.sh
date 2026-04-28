@@ -27,38 +27,49 @@ echo "=== Preparing directory ==="
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-echo "=== Ensuring persistent data directory ==="
-mkdir -p "$APP_DIR/data"
-
 echo "=== Cleaning old deployment (SAFE) ==="
-
-# safer cleanup (DO NOT break workspace root)
-find "$APP_DIR" -mindepth 1 -maxdepth 1 \
-  ! -name "data" \
-  -exec rm -rf {} +
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "data" -exec rm -rf {} +
 
 echo "=== Downloading release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
-echo "=== Extracting FULL workspace ==="
+echo "=== Extracting ==="
 tar -xzf build.tar.gz
 rm -f build.tar.gz
 
-echo "=== Installing dependencies (MONOREPO ROOT) ==="
+echo "=== Finding pnpm workspace root ==="
 
-cd "$APP_DIR"
+# Find the REAL workspace root (must contain pnpm-workspace.yaml OR root package.json with workspace deps)
+ROOT_DIR=$(find "$APP_DIR" -name "pnpm-workspace.yaml" -type f 2>/dev/null | head -n 1 | xargs dirname || true)
 
+# fallback if workspace file not found
+if [ -z "$ROOT_DIR" ]; then
+  ROOT_DIR=$(find "$APP_DIR" -name package.json -not -path "*/node_modules/*" \
+    -exec grep -l '"@workspace/' {} \; \
+    | head -n 1 | xargs dirname)
+fi
+
+if [ -z "$ROOT_DIR" ]; then
+  echo "❌ ERROR: Could not find workspace root"
+  echo "Dumping structure for debugging:"
+  find "$APP_DIR" -maxdepth 4 -name package.json
+  exit 1
+fi
+
+echo "Detected workspace root: $ROOT_DIR"
+
+cd "$ROOT_DIR"
+
+echo "=== Enabling pnpm environment ==="
 export CI=true
 export PNPM_HOME="$HOME/.local/share/pnpm"
 export PATH="$PNPM_HOME:$PATH"
 
-# IMPORTANT: install at workspace root
+echo "=== Installing dependencies (workspace mode) ==="
 pnpm install --frozen-lockfile || pnpm install
 
 echo "=== Building workspace ==="
 pnpm run build || true
 
 echo "=== Starting API server ==="
-
-# run correct workspace package
-pnpm --filter @workspace/api-server start
+exec pnpm --filter @workspace/api-server start
