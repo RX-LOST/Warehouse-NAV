@@ -65,7 +65,7 @@ const STORAGE_KEY = "warehouse-router-config";
 const API_BASE = "/api";
 
 async function uploadFile(file: File, type: "glb" | "photo"): Promise<string> {
-  const endpoint = type === "glb" ? `${API_BASE}/upload/glb` : `${API_BASE}/upload/photo`;
+  const endpoint = `${API_BASE}/upload`;
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(endpoint, { method: "POST", body: form });
@@ -1433,7 +1433,7 @@ export default function App() {
   function fetchServerConfigs() {
     fetch(`${API_BASE}/configs`)
       .then((r) => r.json())
-      .then((d) => setServerConfigs(d.configs ?? []))
+      .then((d) => setServerConfigs(Array.isArray(d) ? d : d.configs ?? []))
       .catch(() => {});
   }
 
