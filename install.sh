@@ -1,88 +1,81 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 set -e
 
+APP_NAME="warehouse-nav"
 APP_DIR="/home/pi/SWP"
-SERVICE_NAME="warehouse-nav"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-RELEASE_URL="https://github.com/RX-LOST/Warehouse-NAV/releases/latest/download/build.tar.gz"
-
-echo "=== Updating system ==="
-sudo apt update
-sudo apt install -y curl tar
+SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 
 echo "=== Installing Node.js (NodeSource) ==="
-if ! command -v node &> /dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt install -y nodejs
-fi
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
 echo "Node version:"
 node -v
 npm -v
 
+echo "=== Installing pnpm ==="
+sudo npm install -g pnpm
+
 echo "=== Preparing directory ==="
 mkdir -p "$APP_DIR"
-cd "$APP_DIR"
 
-echo "=== Ensuring persistent data directory ==="
-mkdir -p "$APP_DIR/artifacts/api-server/data"
-
-echo "=== Cleaning old deployment (preserving data) ==="
-find "$APP_DIR" -mindepth 1 ! -path "$APP_DIR/artifacts/api-server/data*" -exec rm -rf {} +
+echo "=== Cleaning old deployment (SAFE) ==="
+rm -rf "$APP_DIR/artifacts"
 
 echo "=== Downloading release ==="
-curl -L "$RELEASE_URL" -o build.tar.gz
+curl -L "$1" -o /tmp/release.tar.gz
 
 echo "=== Extracting ==="
-tar -xzf build.tar.gz
-rm build.tar.gz
+tar -xzf /tmp/release.tar.gz -C "$APP_DIR"
 
-echo "=== Verifying backend build ==="
-if [ ! -f "$APP_DIR/artifacts/api-server/dist/index.mjs" ]; then
-  echo "ERROR: Backend build missing!"
-  exit 1
-fi
+echo "=== FIXING PERMISSIONS (CRITICAL) ==="
+sudo chown -R pi:pi "$APP_DIR"
+chmod -R 755 "$APP_DIR"
 
-echo "=== Skipping pnpm install (prebuilt artifacts used) ==="
+echo "=== Installing dependencies ==="
+cd "$APP_DIR"
+pnpm install --no-frozen-lockfile || true
 
-echo "=== Creating systemd service ==="
+echo "=== Creating systemd service (if missing) ==="
 
 if [ ! -f "$SERVICE_FILE" ]; then
-  echo "Creating service..."
-
+  echo "Creating new service..."
   sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Warehouse NAV Server
+Description=Warehouse NAV API Server
 After=network.target
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=$APP_DIR/artifacts/api-server
-Environment=NODE_ENV=production
-Environment=HOST=0.0.0.0
-Environment=PORT=3000
 ExecStart=/usr/bin/node dist/index.mjs
 Restart=always
-RestartSec=3
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=3000
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  sudo systemctl daemon-reexec
-  sudo systemctl daemon-reload
-  sudo systemctl enable ${SERVICE_NAME}
 else
-  echo "Service already exists, skipping creation."
+  echo "Service already exists, updating..."
+  sudo sed -i "s|WorkingDirectory=.*|WorkingDirectory=$APP_DIR/artifacts/api-server|" "$SERVICE_FILE"
 fi
 
+echo "=== Reloading systemd ==="
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+
+echo "=== Enabling service ==="
+sudo systemctl enable $APP_NAME
+
 echo "=== Restarting service ==="
-sudo systemctl restart ${SERVICE_NAME}
+sudo systemctl restart $APP_NAME
 
-echo "=== Status ==="
-sudo systemctl status ${SERVICE_NAME} --no-pager
+echo "=== Checking service status ==="
+sleep 2
+sudo systemctl status $APP_NAME --no-pager || true
 
-echo "=== DONE ==="
-echo "Server running at http://<pi-ip>:3000"
+echo "=== Done ==="
+echo "Server should be running on port 3000"
