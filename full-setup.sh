@@ -7,38 +7,27 @@ RELEASE_URL="https://github.com/RX-LOST/Warehouse-NAV/releases/latest/download/b
 
 echo "=== Updating system ==="
 sudo apt update
-sudo apt install -y curl git tar
-
-echo "=== Installing Node.js (runtime only) ==="
-if ! command -v node &> /dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt install -y nodejs
-fi
-
-echo "Node version:"
-node -v
+sudo apt install -y curl tar nodejs npm
 
 echo "=== Installing pnpm ==="
 if ! command -v pnpm &> /dev/null; then
   npm install -g pnpm
 fi
 
-echo "pnpm version:"
-pnpm -v
-
-echo "=== Preparing directory ==="
+echo "=== Setting up directory ==="
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-echo "=== Downloading latest build from GitHub Releases ==="
+echo "=== Downloading latest release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
-echo "=== Extracting build ==="
+echo "=== Extracting ==="
 tar -xzf build.tar.gz
 rm build.tar.gz
 
-echo "=== Installing production dependencies ==="
+echo "=== Installing runtime dependencies (API only) ==="
 cd artifacts/api-server
+
 pnpm install --prod --no-frozen-lockfile
 
 echo "=== Starting server ==="
