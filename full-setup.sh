@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 APP_DIR="/home/pi/SWP"
@@ -29,46 +28,37 @@ mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
 echo "=== Ensuring persistent data directory ==="
-mkdir -p "$APP_DIR/artifacts/api-server/data"
+mkdir -p "$APP_DIR/data"
 
 echo "=== Cleaning old deployment (SAFE) ==="
 
-# SAFE cleanup instead of broken find on pnpm trees
-shopt -s extglob
-
-for item in "$APP_DIR"/*; do
-  case "$item" in
-    "$APP_DIR/artifacts/api-server/data") 
-      echo "Preserving data directory"
-      ;;
-    "$APP_DIR/artifacts/api-server/data/"*)
-      echo "Preserving data contents"
-      ;;
-    *)
-      rm -rf "$item"
-      ;;
-  esac
-done
+# safer cleanup (DO NOT break workspace root)
+find "$APP_DIR" -mindepth 1 -maxdepth 1 \
+  ! -name "data" \
+  -exec rm -rf {} +
 
 echo "=== Downloading release ==="
 curl -L "$RELEASE_URL" -o build.tar.gz
 
-echo "=== Extracting ==="
+echo "=== Extracting FULL workspace ==="
 tar -xzf build.tar.gz
 rm -f build.tar.gz
 
-echo "=== Installing server dependencies ==="
-cd artifacts/api-server
+echo "=== Installing dependencies (MONOREPO ROOT) ==="
+
+cd "$APP_DIR"
 
 export CI=true
-export PNPM_CONFIG_CONFIRM_MODULES_PURGE=false
+export PNPM_HOME="$HOME/.local/share/pnpm"
+export PATH="$PNPM_HOME:$PATH"
 
-# Make pnpm more stable on Pi
-pnpm install --prod --no-frozen-lockfile || npm install --omit=dev
+# IMPORTANT: install at workspace root
+pnpm install --frozen-lockfile || pnpm install
 
-echo "=== Starting server ==="
+echo "=== Building workspace ==="
+pnpm run build || true
 
-export HOST=0.0.0.0
-export PORT=3000
+echo "=== Starting API server ==="
 
-node index.js
+# run correct workspace package
+pnpm --filter @workspace/api-server start
