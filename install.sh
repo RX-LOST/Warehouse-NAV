@@ -1,81 +1,105 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -e
 
-APP_NAME="warehouse-nav"
 APP_DIR="/home/pi/SWP"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+SERVICE_NAME="warehouse-nav"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+RELEASE_URL="https://github.com/RX-LOST/Warehouse-NAV/releases/latest/download/build.tar.gz"
+
+echo "=== Updating system ==="
+sudo apt update
+sudo apt install -y curl tar
 
 echo "=== Installing Node.js (NodeSource) ==="
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
+if ! command -v node &> /dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt install -y nodejs
+fi
 
 echo "Node version:"
 node -v
 npm -v
 
-echo "=== Installing pnpm ==="
-sudo npm install -g pnpm
-
 echo "=== Preparing directory ==="
 mkdir -p "$APP_DIR"
+cd "$APP_DIR"
 
-echo "=== Cleaning old deployment (SAFE) ==="
-rm -rf "$APP_DIR/artifacts"
+echo "=== Ensuring persistent data directory ==="
+mkdir -p "$APP_DIR/artifacts/api-server/data"
+mkdir -p "$APP_DIR/artifacts/api-server/data/photos"
+mkdir -p "$APP_DIR/artifacts/api-server/data/glbs"
+mkdir -p "$APP_DIR/artifacts/api-server/data/configs"
+
+echo "=== Cleaning old deployment (preserving data) ==="
+find "$APP_DIR" -mindepth 1 ! -path "$APP_DIR/artifacts/api-server/data*" -exec rm -rf {} +
 
 echo "=== Downloading release ==="
-curl -L "$1" -o /tmp/release.tar.gz
+curl -L "$RELEASE_URL" -o build.tar.gz
 
 echo "=== Extracting ==="
-tar -xzf /tmp/release.tar.gz -C "$APP_DIR"
+tar -xzf build.tar.gz
+rm build.tar.gz
+
+echo "=== Verifying backend build ==="
+if [ ! -f "$APP_DIR/artifacts/api-server/dist/index.mjs" ]; then
+  echo "ERROR: Backend build missing!"
+  exit 1
+fi
 
 echo "=== FIXING PERMISSIONS (CRITICAL) ==="
+# Ensure the service user (pi) owns everything
 sudo chown -R pi:pi "$APP_DIR"
-chmod -R 755 "$APP_DIR"
 
-echo "=== Installing dependencies ==="
-cd "$APP_DIR"
-pnpm install --no-frozen-lockfile || true
+# Ensure directories are accessible and writable
+find "$APP_DIR" -type d -exec chmod 755 {} \;
+find "$APP_DIR" -type f -exec chmod 644 {} \;
 
-echo "=== Creating systemd service (if missing) ==="
+# Ensure data directories are writable
+chmod -R 775 "$APP_DIR/artifacts/api-server/data"
+
+echo "=== Skipping pnpm install (prebuilt artifacts used) ==="
+
+echo "=== Creating systemd service ==="
 
 if [ ! -f "$SERVICE_FILE" ]; then
-  echo "Creating new service..."
+  echo "Creating service..."
+
   sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Warehouse NAV API Server
+Description=Warehouse NAV Server
 After=network.target
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=$APP_DIR/artifacts/api-server
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
 ExecStart=/usr/bin/node dist/index.mjs
 Restart=always
-RestartSec=5
-Environment=NODE_ENV=production
-Environment=PORT=3000
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  sudo systemctl daemon-reexec
+  sudo systemctl daemon-reload
+  sudo systemctl enable ${SERVICE_NAME}
 else
-  echo "Service already exists, updating..."
+  echo "Service already exists, ensuring correct config..."
+
+  # Ensure working directory stays correct if script changes
   sudo sed -i "s|WorkingDirectory=.*|WorkingDirectory=$APP_DIR/artifacts/api-server|" "$SERVICE_FILE"
 fi
 
-echo "=== Reloading systemd ==="
-sudo systemctl daemon-reexec
-sudo systemctl daemon-reload
-
-echo "=== Enabling service ==="
-sudo systemctl enable $APP_NAME
-
 echo "=== Restarting service ==="
-sudo systemctl restart $APP_NAME
+sudo systemctl restart ${SERVICE_NAME}
 
-echo "=== Checking service status ==="
-sleep 2
-sudo systemctl status $APP_NAME --no-pager || true
+echo "=== Status ==="
+sudo systemctl status ${SERVICE_NAME} --no-pager
 
-echo "=== Done ==="
-echo "Server should be running on port 3000"
+echo "=== DONE ==="
+echo "Server running at http://<pi-ip>:3000"
