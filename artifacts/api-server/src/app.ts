@@ -31,6 +31,7 @@ app.use(
     },
   }),
 );
+
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -46,12 +47,21 @@ const frontendDist = path.resolve(
   "dist",
   "public",
 );
+
 if (fs.existsSync(frontendDist)) {
   app.use(express.static(frontendDist));
-  app.get("*", (_req, res) => {
+
+  // ✅ Express 5-safe catch-all (REPLACES "*")
+  app.use((_req, res) => {
     res.sendFile(path.join(frontendDist, "index.html"));
   });
+
   logger.info({ frontendDist }, "Serving static frontend");
 }
+
+// Optional: API 404 fallback (only for API routes)
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "API route not found" });
+});
 
 export default app;
