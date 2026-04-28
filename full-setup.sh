@@ -2,9 +2,13 @@
 
 set -e
 
+APP_DIR="/home/pi/SWP"
+REPO_URL="https://github.com/RX-LOST/Warehouse-NAV.git"
+BRANCH="Server-Version"
+
 echo "=== Updating system ==="
 sudo apt update
-sudo apt install -y curl build-essential python3 make g++
+sudo apt install -y curl git build-essential python3 make g++
 
 echo "=== Installing Node.js 20 ==="
 if ! command -v node &> /dev/null || [[ $(node -v | cut -d. -f1 | tr -d v) -lt 20 ]]; then
@@ -23,8 +27,23 @@ fi
 echo "pnpm version:"
 pnpm -v
 
+echo "=== Setting up project directory ==="
+
+if [ ! -d "$APP_DIR" ]; then
+  echo "Cloning repository..."
+  git clone -b "$BRANCH" "$REPO_URL" "$APP_DIR"
+else
+  echo "Repository already exists, updating..."
+  cd "$APP_DIR"
+  git fetch
+  git checkout "$BRANCH"
+  git pull
+fi
+
+cd "$APP_DIR"
+
 echo "=== Installing dependencies (workspace) ==="
-pnpm install
+pnpm install --prefer-offline --no-frozen-lockfile
 
 echo "=== Building project ==="
 pnpm build
