@@ -3,15 +3,14 @@
 set -e
 
 APP_DIR="/home/pi/SWP"
-REPO_URL="https://github.com/RX-LOST/Warehouse-NAV.git"
-BRANCH="Server-Version"
+RELEASE_URL="https://github.com/RX-LOST/Warehouse-NAV/releases/latest/download/build.tar.gz"
 
 echo "=== Updating system ==="
 sudo apt update
-sudo apt install -y curl git build-essential python3 make g++
+sudo apt install -y curl git tar
 
-echo "=== Installing Node.js 20 ==="
-if ! command -v node &> /dev/null || [[ $(node -v | cut -d. -f1 | tr -d v) -lt 20 ]]; then
+echo "=== Installing Node.js (runtime only) ==="
+if ! command -v node &> /dev/null; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
   sudo apt install -y nodejs
 fi
@@ -27,62 +26,24 @@ fi
 echo "pnpm version:"
 pnpm -v
 
-echo "=== Setting up project directory ==="
-
-if [ ! -d "$APP_DIR" ]; then
-  echo "Cloning repository..."
-  git clone -b "$BRANCH" "$REPO_URL" "$APP_DIR"
-else
-  echo "Repository exists, updating..."
-  cd "$APP_DIR"
-  git fetch
-  git checkout "$BRANCH"
-  git pull
-fi
-
+echo "=== Preparing directory ==="
+mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-echo "=== Installing dependencies (workspace) ==="
+echo "=== Downloading latest build from GitHub Releases ==="
+curl -L "$RELEASE_URL" -o build.tar.gz
 
-install_deps() {
-  pnpm install --prefer-offline --no-frozen-lockfile --no-optional=false
-}
+echo "=== Extracting build ==="
+tar -xzf build.tar.gz
+rm build.tar.gz
 
-# First attempt
-if ! install_deps; then
-  echo "⚠️ Initial install failed, retrying clean install..."
-  rm -rf node_modules pnpm-lock.yaml
-  install_deps
-fi
+echo "=== Installing production dependencies ==="
+cd artifacts/api-server
+pnpm install --prod --no-frozen-lockfile
 
-echo "=== Building project (with ARM fixes) ==="
-
-build_project() {
-  export ROLLUP_SKIP_NATIVE=true
-  pnpm build
-}
-
-if ! build_project; then
-  echo "⚠️ Full build failed. Attempting fallback (skip frontend builds)..."
-
-  # Try building only API server (skip heavy Vite builds)
-  if [ -d "artifacts/api-server" ]; then
-    cd artifacts/api-server
-    pnpm install --prod || true
-    echo "✅ API server dependencies installed"
-  else
-    echo "❌ API server not found"
-    exit 1
-  fi
-else
-  echo "✅ Full build succeeded"
-fi
-
-echo "=== Starting API server ==="
-
-cd "$APP_DIR/artifacts/api-server"
+echo "=== Starting server ==="
 
 export HOST=0.0.0.0
 export PORT=3000
 
-pnpm start
+node index.js
