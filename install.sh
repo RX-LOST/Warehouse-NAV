@@ -76,7 +76,7 @@ User=pi
 WorkingDirectory=$APP_DIR/artifacts/api-server
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
-Environment=PORT=3000
+Environment=PORT=8080
 ExecStart=/usr/bin/node dist/index.mjs
 Restart=always
 RestartSec=3
@@ -102,4 +102,4 @@ echo "=== Status ==="
 sudo systemctl status ${SERVICE_NAME} --no-pager
 
 echo "=== DONE ==="
-echo "Server running at http://<pi-ip>:3000"
+echo "Server running at http://<pi-ip>:8080"
