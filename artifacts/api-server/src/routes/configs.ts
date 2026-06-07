@@ -31,6 +31,8 @@ router.post("/configs", (req, res) => {
   const dir = CONFIG_DIR;
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(bodyConfig ?? {}, null, 2), "utf8");
+  // Auto-activate saved config as the default
+  fs.writeFileSync(`${dir}/_active`, name, "utf8");
   res.json({ success: true, name });
 });
 
@@ -44,6 +46,38 @@ router.delete("/configs/:name", (req, res) => {
   }
   fs.unlinkSync(filePath);
   res.json({ success: true });
+});
+
+router.get("/configs/active", (_req, res) => {
+  const activePath = `${CONFIG_DIR}/_active`;
+  try {
+    const activeName = fs.readFileSync(activePath, "utf8").trim();
+    if (!activeName) {
+      res.json({ name: null, config: null });
+      return;
+    }
+    const filename = `${activeName}.json`;
+    const data = readJSONFile<Record<string, unknown>>(filename);
+    if (!data) {
+      res.json({ name: null, config: null });
+      return;
+    }
+    res.json({ name: activeName, ...data });
+  } catch {
+    res.json({ name: null, config: null });
+  }
+});
+
+router.post("/configs/activate", (req, res) => {
+  const { name } = req.body ?? {};
+  if (!name || typeof name !== "string") {
+    res.status(400).json({ error: "Bad Request", message: "Config name is required" });
+    return;
+  }
+  const activePath = `${CONFIG_DIR}/_active`;
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(activePath, name, "utf8");
+  res.json({ success: true, name });
 });
 
 export default router;

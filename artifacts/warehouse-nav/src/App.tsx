@@ -512,6 +512,39 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.splatUrl]);
 
+  // Load active/default config from server on mount
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/configs/active`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled || !data?.name) return;
+        const loaded = { ...defaultConfig, ...data } as Config;
+        setConfig(loaded);
+        setLoadedConfigName(data.name);
+        setLoadedConfigHash(JSON.stringify(loaded));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Sync camera to active config's home position when loaded
+  useEffect(() => {
+    const cam = cameraRef.current;
+    if (!cam || !loadedConfigName || !loadedConfigHash) return;
+    cam.position.set(config.homePosition.x, config.homePosition.y, config.homePosition.z);
+    const dir = new THREE.Vector3()
+      .subVectors(fromV3(config.homeLookAt), fromV3(config.homePosition))
+      .normalize();
+    if (dir.length() > 0.001) {
+      yawRef.current = Math.atan2(-dir.x, -dir.z);
+      pitchRef.current = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      applyCameraRotation();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadedConfigName]);
+
   // Apply scene GLB transform when it changes
   useEffect(() => {
     if (glbRootRef.current) {
@@ -1687,6 +1720,7 @@ export default function App() {
       setConfig(loadModalData);
       setLoadedConfigName(loadModalName);
       setLoadedConfigHash(JSON.stringify(loadModalData));
+      activateConfig(loadModalName);
       setShowLoadModal(false);
       setStatusMsg(`Config "${loadModalName}" loaded.`);
     } else {
@@ -1761,6 +1795,16 @@ export default function App() {
     } catch (e: unknown) {
       setStatusMsg(`Rename failed: ${(e as Error).message}`);
     }
+  }
+
+  async function activateConfig(name: string) {
+    try {
+      await fetch(`${API_BASE}/configs/activate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+    } catch {}
   }
 
   function removeObject(id: string) {
