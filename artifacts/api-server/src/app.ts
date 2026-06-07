@@ -1,67 +1,22 @@
-import express, { type Express } from "express";
+import express from "express";
 import cors from "cors";
-import path from "node:path";
-import fs from "node:fs";
-import { fileURLToPath } from "node:url";
-import pinoHttp from "pino-http";
-import router from "./routes";
-import { logger } from "./lib/logger";
+import { IS_PRODUCTION } from "./config.js";
+import { errorHandler } from "./middleware/error.js";
+import routes from "./routes/index.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const app: Express = express();
-
-app.use(
-  pinoHttp({
-    logger,
-    serializers: {
-      req(req) {
-        return {
-          id: req.id,
-          method: req.method,
-          url: req.url?.split("?")[0],
-        };
-      },
-      res(res) {
-        return {
-          statusCode: res.statusCode,
-        };
-      },
-    },
-  }),
-);
+const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "1mb" }));
 
-app.use("/api", router);
+app.use("/api", routes);
 
-// Serve the built frontend (used when deployed standalone on Pi)
-const frontendDist = path.resolve(
-  __dirname,
-  "..",
-  "..",
-  "warehouse-nav",
-  "dist",
-  "public",
-);
-
-if (fs.existsSync(frontendDist)) {
-  app.use(express.static(frontendDist));
-
-  // ✅ Express 5-safe catch-all (REPLACES "*")
+if (!IS_PRODUCTION) {
   app.use((_req, res) => {
-    res.sendFile(path.join(frontendDist, "index.html"));
+    res.status(404).json({ error: "Not Found", message: "Route not found" });
   });
-
-  logger.info({ frontendDist }, "Serving static frontend");
 }
 
-// Optional: API 404 fallback (only for API routes)
-app.use("/api", (_req, res) => {
-  res.status(404).json({ error: "API route not found" });
-});
+app.use(errorHandler);
 
 export default app;

@@ -1,53 +1,44 @@
 import { Router } from "express";
 import fs from "node:fs";
-import path from "node:path";
+import { CONFIG_DIR } from "../config.js";
+import { listFiles, readJSONFile } from "../services/fileStore.js";
+import { requireToken } from "../middleware/auth.js";
 
 const router = Router();
 
-const CONFIG_DIR = path.resolve(process.cwd(), "data/configs");
-
-if (!fs.existsSync(CONFIG_DIR)) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-}
-
-/**
- * Get all configs
- */
 router.get("/configs", (_req, res) => {
-  try {
-    const files = fs.readdirSync(CONFIG_DIR);
-
-    const configs = files.map((file) => {
-      const fullPath = path.join(CONFIG_DIR, file);
-      const raw = fs.readFileSync(fullPath, "utf-8");
-
-      return JSON.parse(raw);
-    });
-
-    return res.json(configs);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to load configs" });
-  }
+  const files = listFiles("configs").filter((f) => f.endsWith(".json"));
+  const configs = files.map((f) => {
+    const name = f.replace(/\.json$/, "");
+    const data = readJSONFile<Record<string, unknown>>(f);
+    return { name, ...data };
+  });
+  res.json({ configs });
 });
 
-/**
- * Save config
- */
-router.post("/configs", (req, res) => {
-  try {
-    const data = req.body;
-
-    const filename = `${Date.now()}.json`;
-    const filePath = path.join(CONFIG_DIR, filename);
-
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-
-    return res.json({ success: true, file: filename });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to save config" });
+router.get("/configs/:name", (req, res) => {
+  const name = req.params["name"]!;
+  const filename = `${name}.json`;
+  const data = readJSONFile<Record<string, unknown>>(filename);
+  if (!data) {
+    res.status(404).json({ error: "Not Found", message: `Config "${name}" not found` });
+    return;
   }
+  res.json({ name, ...data });
+});
+
+router.post("/configs", requireToken, (req, res) => {
+  const { name, positions, shelves } = req.body ?? {};
+  if (!name || typeof name !== "string") {
+    res.status(400).json({ error: "Bad Request", message: "Config name is required" });
+    return;
+  }
+  const config = { positions: positions ?? [], shelves: shelves ?? [] };
+  const filename = name.endsWith(".json") ? name : `${name}.json`;
+  const dir = CONFIG_DIR;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(config, null, 2), "utf8");
+  res.json({ success: true, name });
 });
 
 export default router;
