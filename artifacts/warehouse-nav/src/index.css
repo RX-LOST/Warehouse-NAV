@@ -122,3 +122,11 @@ label {
   color: #6b7280;
   font-size: 11px;
 }
+
+/* Hide scrollbar for admin/runtime panels */
+.panel-scroll {
+  scrollbar-width: none;
+}
+.panel-scroll::-webkit-scrollbar {
+  display: none;
+}

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import fs from "node:fs";
 import { CONFIG_DIR } from "../config.js";
-import { listFiles, readJSONFile } from "../services/fileStore.js";
+import { listFiles, readJSONFile, getFilePath } from "../services/fileStore.js";
 const router = Router();
 
 router.get("/configs", (_req, res) => {
@@ -32,6 +32,18 @@ router.post("/configs", (req, res) => {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(bodyConfig ?? {}, null, 2), "utf8");
   res.json({ success: true, name });
+});
+
+router.delete("/configs/:name", (req, res) => {
+  const name = req.params["name"]!;
+  const filename = `${name}.json`;
+  const filePath = getFilePath(filename, "configs");
+  if (!filePath) {
+    res.status(404).json({ error: "Not Found", message: `Config "${name}" not found` });
+    return;
+  }
+  fs.unlinkSync(filePath);
+  res.json({ success: true });
 });
 
 export default router;

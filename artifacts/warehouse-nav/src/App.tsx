@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import NodeGraphView from "./NodeGraphView";
@@ -184,7 +184,25 @@ export default function App() {
   const [webglError, setWebglError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [serverConfigs, setServerConfigs] = useState<string[]>([]);
-  const [serverConfigName, setServerConfigName] = useState("default");
+  const [loadedConfigName, setLoadedConfigName] = useState<string | null>(null);
+  const [loadedConfigHash, setLoadedConfigHash] = useState("");
+  const [selectedConfigLoad, setSelectedConfigLoad] = useState("");
+  const [showLoadModal, setShowLoadModal] = useState(false);
+  const [loadModalData, setLoadModalData] = useState<Config | null>(null);
+  const [loadModalName, setLoadModalName] = useState("");
+  const [loadModalChecks, setLoadModalChecks] = useState<Record<string, boolean>>({});
+  const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [showNewConfigInput, setShowNewConfigInput] = useState(false);
+  const [newConfigName, setNewConfigName] = useState("");
+  const [showManageConfigs, setShowManageConfigs] = useState(false);
+  const [showPartialNamePrompt, setShowPartialNamePrompt] = useState(false);
+  const [partialMergeResult, setPartialMergeResult] = useState<Config | null>(null);
+  const [partialInputName, setPartialInputName] = useState("");
+  const [manageRenameTarget, setManageRenameTarget] = useState<string | null>(null);
+  const [manageRenameValue, setManageRenameValue] = useState("");
+  const [manageViewData, setManageViewData] = useState<{ name: string; data: string } | null>(null);
+  const [showManageNewInput, setShowManageNewInput] = useState(false);
+  const [manageNewName, setManageNewName] = useState("");
   const [adminToken, setAdminToken] = useState<string | null>(() => sessionStorage.getItem("admin-token"));
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
@@ -1097,9 +1115,9 @@ export default function App() {
       nav.pathLineRef = null;
     }
     try {
-      const points = path.map(fromV3);
+      const points = path.map((p) => fromV3({ x: p.x, y: p.y - 0.3, z: p.z }));
       const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.5);
-      const tubeGeo = new THREE.TubeGeometry(curve, Math.max(20, path.length * 8), 0.03, 6, false);
+      const tubeGeo = new THREE.TubeGeometry(curve, Math.max(20, path.length * 8), 0.03, 24, false);
       // Outer glow: additive blending, low opacity
       const glowMat = new THREE.MeshBasicMaterial({
         color: 0x00c8ff,
@@ -1430,11 +1448,12 @@ export default function App() {
   }
 
   // ---------- File handling ----------
-  function fetchServerConfigs() {
-    fetch(`${API_BASE}/configs`)
-      .then((r) => r.json())
-      .then((d) => setServerConfigs(Array.isArray(d) ? d : d.configs ?? []))
-      .catch(() => {});
+  async function fetchServerConfigs() {
+    try {
+      const r = await fetch(`${API_BASE}/configs`);
+      const d = await r.json();
+      setServerConfigs(Array.isArray(d) ? d : d.configs ?? []);
+    } catch {}
   }
 
   useEffect(() => {
@@ -1574,37 +1593,174 @@ export default function App() {
     }
   }
 
-  function saveConfigToServer() {
-    const name = serverConfigName.trim() || "default";
+  async function saveConfigToServer(name: string, configToSave?: Config) {
+    const data = configToSave ?? config;
     const cleaned: Config = {
-      ...config,
-      glbUrl: config.glbUrl?.startsWith("blob:") ? null : config.glbUrl,
+      ...data,
+      glbUrl: data.glbUrl?.startsWith("blob:") ? null : data.glbUrl,
       shelves: Object.fromEntries(
-        Object.entries(config.shelves).map(([k, s]) => [k, { ...s, panoramaUrl: s.panoramaUrl?.startsWith("blob:") ? null : s.panoramaUrl }])
+        Object.entries(data.shelves).map(([k, s]) => [k, { ...s, panoramaUrl: s.panoramaUrl?.startsWith("blob:") ? null : s.panoramaUrl }])
       ),
-      objects: config.objects.map((o) => ({ ...o, url: o.url.startsWith("blob:") ? "" : o.url })),
+      objects: data.objects.map((o) => ({ ...o, url: o.url.startsWith("blob:") ? "" : o.url })),
     };
-    fetch(`${API_BASE}/configs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, config: cleaned }),
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        setStatusMsg(`Config saved as "${d.name}".`);
-        fetchServerConfigs();
-      })
-      .catch((e) => setStatusMsg(`Save failed: ${e.message}`));
+    try {
+      const r = await fetch(`${API_BASE}/configs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, config: cleaned }),
+      });
+      const d = await r.json();
+      setStatusMsg(`Config saved as "${d.name}".`);
+      setLoadedConfigName(name);
+      setLoadedConfigHash(JSON.stringify(data));
+      await fetchServerConfigs();
+    } catch (e: unknown) {
+      setStatusMsg(`Save failed: ${(e as Error).message}`);
+    }
   }
 
   function loadConfigFromServer(name: string) {
     fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`)
       .then((r) => r.json())
       .then((data) => {
-        setConfig({ ...defaultConfig, ...data });
+        const loaded = { ...defaultConfig, ...data } as Config;
+        setConfig(loaded);
+        setLoadedConfigName(name);
+        setLoadedConfigHash(JSON.stringify(loaded));
         setStatusMsg(`Config "${name}" loaded from server.`);
       })
       .catch((e) => setStatusMsg(`Load failed: ${e.message}`));
+  }
+
+  const configDirty = useMemo(() => {
+    if (!loadedConfigName || !loadedConfigHash) return false;
+    return JSON.stringify(config) !== loadedConfigHash;
+  }, [config, loadedConfigName, loadedConfigHash]);
+
+  function getConfigDiff() {
+    if (!loadedConfigHash) return {};
+    const snap = JSON.parse(loadedConfigHash) as Config;
+    return {
+      "Warehouse Model": {
+        changed: snap.glbUrl !== config.glbUrl || snap.splatUrl !== config.splatUrl || JSON.stringify(snap.glbTransform) !== JSON.stringify(config.glbTransform),
+        summary: config.glbUrl ? (config.glbUrl.startsWith("blob:") ? "Local model" : "Server model") : "No model",
+      },
+      "Scene Objects": {
+        changed: JSON.stringify(snap.objects) !== JSON.stringify(config.objects),
+        summary: `${config.objects.length} object(s)`,
+      },
+      "Home Position": {
+        changed: JSON.stringify({ p: snap.homePosition, l: snap.homeLookAt, n: snap.homeNodeId }) !== JSON.stringify({ p: config.homePosition, l: config.homeLookAt, n: config.homeNodeId }),
+        summary: `(${config.homePosition.x.toFixed(1)}, ${config.homePosition.y.toFixed(1)}, ${config.homePosition.z.toFixed(1)})`,
+      },
+      "Path Nodes": {
+        changed: JSON.stringify(snap.pathNodes) !== JSON.stringify(config.pathNodes),
+        summary: `${Object.keys(config.pathNodes).length} node(s)`,
+      },
+      "Camera Speed": {
+        changed: snap.cameraSpeed !== config.cameraSpeed,
+        summary: `${config.cameraSpeed} u/s`,
+      },
+      "Shelves": {
+        changed: JSON.stringify(snap.shelves) !== JSON.stringify(config.shelves),
+        summary: `${Object.keys(config.shelves).length} shelf/shelves`,
+      },
+    };
+  }
+
+  function previewLoadConfig(name: string) {
+    fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        setLoadModalData({ ...defaultConfig, ...data } as Config);
+        setLoadModalName(name);
+        setLoadModalChecks({ model: true, objects: true, home: true, pathNodes: true, cameraSpeed: true, shelves: true });
+        setShowLoadModal(true);
+      })
+      .catch((e) => setStatusMsg(`Load failed: ${e.message}`));
+  }
+
+  function applyLoadConfig() {
+    if (!loadModalData) return;
+    const allChecked = Object.values(loadModalChecks).every(Boolean);
+    if (allChecked) {
+      setConfig(loadModalData);
+      setLoadedConfigName(loadModalName);
+      setLoadedConfigHash(JSON.stringify(loadModalData));
+      setShowLoadModal(false);
+      setStatusMsg(`Config "${loadModalName}" loaded.`);
+    } else {
+      const merged: Config = JSON.parse(JSON.stringify(config));
+      if (loadModalChecks.model) {
+        merged.glbUrl = loadModalData.glbUrl;
+        merged.splatUrl = loadModalData.splatUrl;
+        merged.glbTransform = { ...loadModalData.glbTransform };
+      }
+      if (loadModalChecks.objects) merged.objects = [...loadModalData.objects];
+      if (loadModalChecks.home) {
+        merged.homePosition = { ...loadModalData.homePosition };
+        merged.homeLookAt = { ...loadModalData.homeLookAt };
+        merged.homeNodeId = loadModalData.homeNodeId;
+      }
+      if (loadModalChecks.pathNodes) merged.pathNodes = { ...loadModalData.pathNodes };
+      if (loadModalChecks.cameraSpeed) merged.cameraSpeed = loadModalData.cameraSpeed;
+      if (loadModalChecks.shelves) merged.shelves = { ...loadModalData.shelves };
+      setPartialMergeResult(merged);
+      setShowPartialNamePrompt(true);
+      setShowLoadModal(false);
+    }
+  }
+
+  function confirmPartialLoad(name: string) {
+    if (!partialMergeResult) return;
+    saveConfigToServer(name, partialMergeResult);
+    setConfig(partialMergeResult);
+    setLoadedConfigName(name);
+    setLoadedConfigHash(JSON.stringify(partialMergeResult));
+    setShowPartialNamePrompt(false);
+    setPartialMergeResult(null);
+    setStatusMsg(`Created config "${name}" with merged settings.`);
+  }
+
+  function confirmUpdateConfig() {
+    if (!loadedConfigName) return;
+    saveConfigToServer(loadedConfigName);
+    setShowUpdateModal(false);
+  }
+
+  async function deleteServerConfig(name: string) {
+    try {
+      await fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (loadedConfigName === name) {
+        setLoadedConfigName(null);
+        setLoadedConfigHash("");
+      }
+      await fetchServerConfigs();
+      setStatusMsg(`Config "${name}" deleted.`);
+    } catch (e: unknown) {
+      setStatusMsg(`Delete failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function renameServerConfig(oldName: string, newName: string) {
+    try {
+      const r = await fetch(`${API_BASE}/configs/${encodeURIComponent(oldName)}`);
+      const data = await r.json();
+      const cleaned: Config = {
+        ...data,
+        glbUrl: data.glbUrl?.startsWith("blob:") ? null : data.glbUrl,
+        shelves: Object.fromEntries(
+          Object.entries(data.shelves || {}).map(([k, s]) => [k, { ...(s as Shelf), panoramaUrl: (s as Shelf).panoramaUrl?.startsWith("blob:") ? null : (s as Shelf).panoramaUrl }])
+        ),
+        objects: (data.objects || []).map((o: SceneObject) => ({ ...o, url: o.url.startsWith("blob:") ? "" : o.url })),
+      };
+      await saveConfigToServer(newName, cleaned);
+      await deleteServerConfig(oldName);
+      if (loadedConfigName === oldName) setLoadedConfigName(newName);
+      setStatusMsg(`Config renamed to "${newName}".`);
+    } catch (e: unknown) {
+      setStatusMsg(`Rename failed: ${(e as Error).message}`);
+    }
   }
 
   function removeObject(id: string) {
@@ -2146,7 +2302,7 @@ export default function App() {
         }}
       >
         <div
-          className="panel"
+          className="panel panel-scroll"
           style={{
             pointerEvents: "auto",
             minWidth: 280,
@@ -2247,11 +2403,22 @@ export default function App() {
               resetObjectTransform={resetObjectTransform}
               setConfig={setConfig}
               uploading={uploading}
-              serverConfigs={serverConfigs}
-              serverConfigName={serverConfigName}
-              setServerConfigName={setServerConfigName}
-              saveConfigToServer={saveConfigToServer}
-              loadConfigFromServer={loadConfigFromServer}
+               serverConfigs={serverConfigs}
+               loadedConfigName={loadedConfigName}
+               configDirty={configDirty}
+               selectedConfigLoad={selectedConfigLoad}
+               setSelectedConfigLoad={setSelectedConfigLoad}
+               showNewConfigInput={showNewConfigInput}
+               setShowNewConfigInput={setShowNewConfigInput}
+               newConfigName={newConfigName}
+               setNewConfigName={setNewConfigName}
+               saveConfigToServer={saveConfigToServer}
+               previewLoadConfig={previewLoadConfig}
+               setShowUpdateModal={setShowUpdateModal}
+               showManageConfigs={showManageConfigs}
+               setShowManageConfigs={setShowManageConfigs}
+               deleteServerConfig={deleteServerConfig}
+               renameServerConfig={renameServerConfig}
               logoutAdmin={logoutAdmin}
               showChangePassword={showChangePassword}
               setShowChangePassword={setShowChangePassword}
@@ -2418,7 +2585,7 @@ export default function App() {
           onClick={(e) => { if (e.target === e.currentTarget) setShowPasswordModal(false); }}
         >
           <div
-            className="panel"
+          className="panel panel-scroll"
             style={{ width: 280, pointerEvents: "auto" }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -2439,6 +2606,136 @@ export default function App() {
               <button className="primary" onClick={loginAdmin}>Login</button>
               <button onClick={() => setShowPasswordModal(false)}>Cancel</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Update confirmation modal */}
+      {showUpdateModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowUpdateModal(false); }}>
+          <div className="panel panel-scroll" style={{ width: 360, maxHeight: "80vh", overflowY: "auto", pointerEvents: "auto" }}
+            onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ marginTop: 0, marginBottom: 8 }}>Update Config</h4>
+            <div className="col" style={{ gap: 2, fontSize: 12 }}>
+              {Object.entries(getConfigDiff()).map(([section, info]) => (
+                <div key={section} className="row" style={{ justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #2a3038" }}>
+                  <span>{section}</span>
+                  <span style={{ color: info.changed ? "#fbbf24" : "#6b7280" }}>{info.changed ? "● " : "· "}{info.summary}</span>
+                </div>
+              ))}
+            </div>
+            <div className="divider" />
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button className="primary" onClick={confirmUpdateConfig}>Save Changes</button>
+              <button onClick={() => setShowUpdateModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Load confirmation modal */}
+      {showLoadModal && loadModalData && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowLoadModal(false); }}>
+          <div className="panel panel-scroll" style={{ width: 360, maxHeight: "80vh", overflowY: "auto", pointerEvents: "auto" }}
+            onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ marginTop: 0, marginBottom: 4 }}>Load Config: {loadModalName}</h4>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+              Uncheck any settings to keep current values:
+            </div>
+            <div className="col" style={{ gap: 2, fontSize: 12 }}>
+              {[{ key: "model", label: "Warehouse Model" }, { key: "objects", label: "Scene Objects" }, { key: "home", label: "Home Position" }, { key: "pathNodes", label: "Path Nodes" }, { key: "cameraSpeed", label: "Camera Speed" }, { key: "shelves", label: "Shelves" }].map(({ key, label }) => (
+                <label key={key} className="row" style={{ cursor: "pointer", gap: 8, padding: "4px 0" }}>
+                  <input type="checkbox" checked={loadModalChecks[key] ?? true} onChange={(e) => setLoadModalChecks((p) => ({ ...p, [key]: e.target.checked }))} />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <div className="divider" />
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button className="primary" onClick={applyLoadConfig}>Apply</button>
+              <button onClick={() => setShowLoadModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Partial load name prompt */}
+      {showPartialNamePrompt && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 110 }}
+          onClick={(e) => { if (e.target === e.currentTarget) { setShowPartialNamePrompt(false); setPartialMergeResult(null); } }}>
+          <div className="panel" style={{ width: 320, pointerEvents: "auto" }} onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ marginTop: 0, marginBottom: 4 }}>Save as New Config</h4>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+              Not all settings were selected. Enter a name to save as a new config:
+            </div>
+            <input autoFocus placeholder="Config name" value={partialInputName} onChange={(e) => setPartialInputName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && partialInputName.trim()) confirmPartialLoad(partialInputName.trim()); }}
+              style={{ width: "100%", fontSize: 12, marginBottom: 8 }} />
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button className="primary" onClick={() => { if (partialInputName.trim()) confirmPartialLoad(partialInputName.trim()); }}>Save & Load</button>
+              <button onClick={() => { setShowPartialNamePrompt(false); setPartialMergeResult(null); setPartialInputName(""); }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manage configs modal */}
+      {showManageConfigs && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowManageConfigs(false); }}>
+          <div className="panel panel-scroll" style={{ width: 380, maxHeight: "80vh", overflowY: "auto", pointerEvents: "auto" }}
+            onClick={(e) => e.stopPropagation()}>
+            <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+              <h4 style={{ margin: 0 }}>Manage Configs</h4>
+              <button onClick={() => setShowManageConfigs(false)}>✕</button>
+            </div>
+            {showManageNewInput ? (
+              <div className="col" style={{ gap: 4, marginBottom: 8 }}>
+                <input value={manageNewName} onChange={(e) => setManageNewName(e.target.value)} placeholder="Config name" autoFocus />
+                <div className="row">
+                  <button className="primary" onClick={() => { if (manageNewName.trim()) { saveConfigToServer(manageNewName.trim()); setShowManageNewInput(false); setManageNewName(""); } }}>Create</button>
+                  <button onClick={() => { setShowManageNewInput(false); setManageNewName(""); }}>Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setShowManageNewInput(true)} style={{ width: "100%", marginBottom: 8 }}>+ Create New Config</button>
+            )}
+            {serverConfigs.map((name) => (
+              <div key={name} style={{ borderBottom: "1px solid #2a3038", padding: "6px 0" }}>
+                {manageRenameTarget === name ? (
+                  <div className="col" style={{ gap: 4 }}>
+                    <input value={manageRenameValue} onChange={(e) => setManageRenameValue(e.target.value)} placeholder="New name" autoFocus style={{ fontSize: 12 }} />
+                    <div className="row" style={{ gap: 4 }}>
+                      <button className="primary" onClick={() => { if (manageRenameValue.trim() && manageRenameValue.trim() !== name) renameServerConfig(name, manageRenameValue.trim()); setManageRenameTarget(null); }}>Save</button>
+                      <button onClick={() => setManageRenameTarget(null)}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, fontWeight: 600 }}>{name}</span>
+                    <div className="row" style={{ gap: 4 }}>
+                      <button style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => { fetch(`${API_BASE}/configs/${encodeURIComponent(name)}`).then((r) => r.json()).then((d) => setManageViewData({ name, data: JSON.stringify(d, null, 2) })).catch(() => {}); }}>View</button>
+                      <button style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => { setManageRenameTarget(name); setManageRenameValue(name); }}>Rename</button>
+                      <button className="danger" style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => { if (confirm(`Delete config "${name}"?`)) deleteServerConfig(name); }}>✕</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+            {manageViewData && (
+              <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 110 }}
+                onClick={() => setManageViewData(null)}>
+                <div className="panel panel-scroll" style={{ width: 420, maxHeight: "80vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+                  <div className="row" style={{ justifyContent: "space-between", marginBottom: 8 }}>
+                    <h4 style={{ margin: 0 }}>{manageViewData.name}</h4>
+                    <button onClick={() => setManageViewData(null)}>✕</button>
+                  </div>
+                  <pre style={{ fontSize: 10, color: "#9ca3af", whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: "50vh", overflowY: "auto" }}>{manageViewData.data}</pre>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2487,10 +2784,21 @@ function AdminPanel(props: {
   setConfig: React.Dispatch<React.SetStateAction<Config>>;
   uploading: boolean;
   serverConfigs: string[];
-  serverConfigName: string;
-  setServerConfigName: (s: string) => void;
-  saveConfigToServer: () => void;
-  loadConfigFromServer: (name: string) => void;
+  loadedConfigName: string | null;
+  configDirty: boolean;
+  selectedConfigLoad: string;
+  setSelectedConfigLoad: (s: string) => void;
+  showNewConfigInput: boolean;
+  setShowNewConfigInput: (v: boolean) => void;
+  newConfigName: string;
+  setNewConfigName: (s: string) => void;
+  saveConfigToServer: (name: string, configToSave?: Config) => void;
+  previewLoadConfig: (name: string) => void;
+  setShowUpdateModal: (v: boolean) => void;
+  showManageConfigs: boolean;
+  setShowManageConfigs: (v: boolean) => void;
+  deleteServerConfig: (name: string) => void;
+  renameServerConfig: (oldName: string, newName: string) => void;
   logoutAdmin: () => void;
   showChangePassword: boolean;
   setShowChangePassword: (v: boolean) => void;
@@ -2540,10 +2848,21 @@ function AdminPanel(props: {
     setConfig,
     uploading,
     serverConfigs,
-    serverConfigName,
-    setServerConfigName,
+    loadedConfigName,
+    configDirty,
+    selectedConfigLoad,
+    setSelectedConfigLoad,
+    showNewConfigInput,
+    setShowNewConfigInput,
+    newConfigName,
+    setNewConfigName,
     saveConfigToServer,
-    loadConfigFromServer,
+    previewLoadConfig,
+    setShowUpdateModal,
+    showManageConfigs,
+    setShowManageConfigs,
+    deleteServerConfig,
+    renameServerConfig,
     logoutAdmin,
     showChangePassword,
     setShowChangePassword,
@@ -2932,43 +3251,100 @@ function AdminPanel(props: {
 
       <div className="divider" />
 
-      <h4>Config</h4>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+        <h4 style={{ margin: 0 }}>Config</h4>
+        <button
+          onClick={() => setShowManageConfigs(true)}
+          style={{ fontSize: 11, padding: "4px 8px" }}
+          title="Manage Configs"
+        >
+          🎛️
+        </button>
+      </div>
 
-      <div className="col" style={{ gap: 4 }}>
-        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 2 }}>Save / load on this device</div>
-        <div className="row" style={{ gap: 4 }}>
+      <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>
+        Current: <strong style={{ color: "#e6e8eb" }}>{loadedConfigName ?? "local"}</strong>
+      </div>
+
+      <button
+        onClick={() => setShowUpdateModal(true)}
+        disabled={!configDirty}
+        style={{
+          width: "100%",
+          opacity: configDirty ? 1 : 0.4,
+          cursor: configDirty ? "pointer" : "not-allowed",
+          fontSize: 12,
+          padding: "8px 10px",
+          marginBottom: 4,
+        }}
+      >
+        {configDirty ? "● Update Current" : "Update Current"}
+      </button>
+
+      {showNewConfigInput ? (
+        <div className="col" style={{ gap: 4, marginBottom: 4 }}>
           <input
-            value={serverConfigName}
-            onChange={(e) => setServerConfigName(e.target.value)}
-            placeholder="Config name"
-            style={{ flex: 1, fontSize: 12 }}
+            value={newConfigName}
+            onChange={(e) => setNewConfigName(e.target.value)}
+            placeholder="New config name"
+            style={{ fontSize: 12 }}
+            autoFocus
           />
+          <div className="row">
+            <button
+              className="primary"
+              style={{ fontSize: 12 }}
+              onClick={() => {
+                if (newConfigName.trim()) {
+                  saveConfigToServer(newConfigName.trim());
+                  setShowNewConfigInput(false);
+                  setNewConfigName("");
+                }
+              }}
+            >
+              Save New
+            </button>
+            <button
+              style={{ fontSize: 12 }}
+              onClick={() => { setShowNewConfigInput(false); setNewConfigName(""); }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setShowNewConfigInput(true)}
+          style={{ width: "100%", fontSize: 12, marginBottom: 4 }}
+        >
+          + Create New
+        </button>
+      )}
+
+      {serverConfigs.length > 0 && (
+        <div className="row" style={{ gap: 4, marginBottom: 4 }}>
+          <select
+            style={{ flex: 1, fontSize: 12 }}
+            value={selectedConfigLoad}
+            onChange={(e) => setSelectedConfigLoad(e.target.value)}
+          >
+            <option value="">— Load config —</option>
+            {serverConfigs.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
           <button
             className="primary"
             style={{ fontSize: 12, padding: "4px 10px" }}
-            onClick={saveConfigToServer}
+            disabled={!selectedConfigLoad}
+            onClick={() => {
+              if (selectedConfigLoad) previewLoadConfig(selectedConfigLoad);
+            }}
           >
-            Save
+            Load
           </button>
         </div>
-        {serverConfigs.length > 0 && (
-          <div className="row" style={{ gap: 4 }}>
-            <select
-              style={{ flex: 1, fontSize: 12 }}
-              defaultValue=""
-              onChange={(e) => {
-                if (e.target.value) loadConfigFromServer(e.target.value);
-                e.target.value = "";
-              }}
-            >
-              <option value="">— Load saved config —</option>
-              {serverConfigs.map((n) => (
-                <option key={n} value={n}>{n}</option>
-              ))}
-            </select>
-          </div>
-        )}
-      </div>
+      )}
 
       <div className="divider" />
 
