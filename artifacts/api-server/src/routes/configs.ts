@@ -1,35 +1,45 @@
 import { Router } from "express";
 import fs from "node:fs";
-import { CONFIG_DIR } from "../config.js";
-import { listFiles, readJSONFile, getFilePath } from "../services/fileStore.js";
+import path from "node:path";
+import {
+  listConfigNames,
+  configNameExists,
+  deleteConfigDir,
+  ensureConfigDir,
+  getConfigDir,
+  saveConfigJson,
+  readConfigJson,
+  getActiveConfigName,
+  setActiveConfigName,
+  copyToConfig,
+  getConfigFilePath,
+} from "../services/fileStore.js";
+
 const router = Router();
 
+// ---------------------------------------------------------------------------
+// List configs
+// ---------------------------------------------------------------------------
 router.get("/configs", (_req, res) => {
-  const files = listFiles("configs").filter((f) => f.endsWith(".json"));
-  const names = files.map((f) => f.replace(/\.json$/, ""));
+  const names = listConfigNames();
   res.json({ configs: names });
 });
 
-// Specific routes must come before parameterized /configs/:name
-
+// ---------------------------------------------------------------------------
+// Active config
+// ---------------------------------------------------------------------------
 router.get("/configs/active", (_req, res) => {
-  const activePath = `${CONFIG_DIR}/_active`;
-  try {
-    const activeName = fs.readFileSync(activePath, "utf8").trim();
-    if (!activeName) {
-      res.json({ name: null, config: null });
-      return;
-    }
-    const filename = `${activeName}.json`;
-    const data = readJSONFile<Record<string, unknown>>(filename);
-    if (!data) {
-      res.json({ name: null, config: null });
-      return;
-    }
-    res.json({ name: activeName, ...data });
-  } catch {
+  const name = getActiveConfigName();
+  if (!name) {
     res.json({ name: null, config: null });
+    return;
   }
+  const data = readConfigJson<Record<string, unknown>>(name);
+  if (!data) {
+    res.json({ name: null, config: null });
+    return;
+  }
+  res.json({ name, ...data });
 });
 
 router.post("/configs/activate", (req, res) => {
@@ -38,16 +48,46 @@ router.post("/configs/activate", (req, res) => {
     res.status(400).json({ error: "Bad Request", message: "Config name is required" });
     return;
   }
-  const activePath = `${CONFIG_DIR}/_active`;
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(activePath, name, "utf8");
+  if (!configNameExists(name)) {
+    res.status(404).json({ error: "Not Found", message: `Config "${name}" does not exist` });
+    return;
+  }
+  setActiveConfigName(name);
   res.json({ success: true, name });
 });
 
+// ---------------------------------------------------------------------------
+// Serve files from config folders
+// GET /configs/files/:name/:type/:filename
+// ---------------------------------------------------------------------------
+router.get("/configs/files/:name/:type/:filename", (req, res) => {
+  const { name, type, filename } = req.params as Record<string, string>;
+  const filePath = getConfigFilePath(name, type, filename);
+  if (!filePath) {
+    res.status(404).json({ error: "Not Found", message: "File not found" });
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeMap: Record<string, string> = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".ksplat": "application/octet-stream",
+    ".splat": "application/octet-stream",
+  };
+  res.type(mimeMap[ext] ?? "application/octet-stream").sendFile(filePath);
+});
+
+// ---------------------------------------------------------------------------
+// Get single config
+// ---------------------------------------------------------------------------
 router.get("/configs/:name", (req, res) => {
   const name = req.params["name"]!;
-  const filename = `${name}.json`;
-  const data = readJSONFile<Record<string, unknown>>(filename);
+  const data = readConfigJson<Record<string, unknown>>(name);
   if (!data) {
     res.status(404).json({ error: "Not Found", message: `Config "${name}" not found` });
     return;
@@ -55,30 +95,109 @@ router.get("/configs/:name", (req, res) => {
   res.json({ name, ...data });
 });
 
+// ---------------------------------------------------------------------------
+// Save / create config
+//
+// Receives { name, config: { glbUrl, splatUrl, shelves, objects, ... } }
+// Copies referenced files from staging or old configs into the config folder,
+// rewrites URLs, and saves config.json.
+// ---------------------------------------------------------------------------
 router.post("/configs", (req, res) => {
   const { name, config: bodyConfig } = req.body ?? {};
   if (!name || typeof name !== "string") {
     res.status(400).json({ error: "Bad Request", message: "Config name is required" });
     return;
   }
-  const filename = name.endsWith(".json") ? name : `${name}.json`;
-  const dir = CONFIG_DIR;
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(bodyConfig ?? {}, null, 2), "utf8");
-  // Auto-activate saved config as the default
-  fs.writeFileSync(`${dir}/_active`, name, "utf8");
-  res.json({ success: true, name });
+
+  const cfg = bodyConfig ?? {};
+  const configName = name.replace(/\.json$/i, "");
+
+  // Check for duplicate (skip for update — same name is OK)
+  const alreadySaved = readConfigJson(configName);
+  if (!alreadySaved && configNameExists(configName)) {
+    // This shouldn't happen normally, but guard against name collisions
+  }
+
+  // Ensure the config folder exists
+  ensureConfigDir(configName);
+
+  // Helper: resolve and copy a file, return the new URL or the original if unchanged
+  const resolveFile = (
+    url: string | null | undefined,
+    subdir: string,
+    destName: string,
+  ): string | null | undefined => {
+    if (!url || typeof url !== "string") return url;
+    // Skip blob URLs and external URLs
+    if (url.startsWith("blob:") || url.startsWith("http://") || url.startsWith("https://")) return url;
+    const result = copyToConfig(url, configName, subdir, destName);
+    return result ?? url;
+  };
+
+  const ext = (url: string): string => path.extname(url).toLowerCase();
+
+  // --- glbUrl → glb/scene.glb ---
+  cfg.glbUrl = resolveFile(cfg.glbUrl, "glb", "scene.glb") ?? null;
+
+  // --- splatUrl → splat/scene.{ext} ---
+  if (cfg.splatUrl && typeof cfg.splatUrl === "string" && !cfg.splatUrl.startsWith("blob:") && !cfg.splatUrl.startsWith("http")) {
+    const splatExt = ext(cfg.splatUrl) || ".ksplat";
+    cfg.splatUrl = resolveFile(cfg.splatUrl, "splat", `scene${splatExt}`) ?? null;
+  }
+
+  // --- Scene objects → glb/<original-filename> ---
+  if (Array.isArray(cfg.objects)) {
+    cfg.objects = cfg.objects.map((o: Record<string, unknown>) => {
+      if (o.url && typeof o.url === "string") {
+        // Extract original filename from URL path
+        const urlPath = o.url;
+        const originalName = urlPath.split("/").pop() || "object.glb";
+        o.url = resolveFile(o.url, "glb", originalName) ?? "";
+      }
+      return o;
+    });
+  }
+
+  // --- Shelves → 360/<shelf-id>.<ext> ---
+  if (cfg.shelves && typeof cfg.shelves === "object") {
+    const updatedShelves: Record<string, unknown> = {};
+    for (const [shelfId, shelf] of Object.entries(cfg.shelves as Record<string, unknown>)) {
+      const s = { ...(shelf as Record<string, unknown>) };
+      if (s.panoramaUrl && typeof s.panoramaUrl === "string" && !s.panoramaUrl.startsWith("blob:") && !s.panoramaUrl.startsWith("http")) {
+        const panoramaExt = ext(s.panoramaUrl) || ".jpg";
+        s.panoramaUrl = resolveFile(s.panoramaUrl, "360", `${shelfId}${panoramaExt}`) ?? null;
+      }
+      updatedShelves[shelfId] = s;
+    }
+    cfg.shelves = updatedShelves;
+  }
+
+  // Save config.json
+  saveConfigJson(configName, cfg);
+
+  // Auto-activate
+  setActiveConfigName(configName);
+
+  // Return the updated config so the frontend can update its URLs
+  res.json({ success: true, name: configName, config: cfg });
 });
 
+// ---------------------------------------------------------------------------
+// Delete config
+// ---------------------------------------------------------------------------
 router.delete("/configs/:name", (req, res) => {
   const name = req.params["name"]!;
-  const filename = `${name}.json`;
-  const filePath = getFilePath(filename, "configs");
-  if (!filePath) {
+  if (!configNameExists(name)) {
     res.status(404).json({ error: "Not Found", message: `Config "${name}" not found` });
     return;
   }
-  fs.unlinkSync(filePath);
+  deleteConfigDir(name);
+
+  // If deleted config was active, clear active
+  if (getActiveConfigName() === name) {
+    setActiveConfigName("");
+  }
+
   res.json({ success: true });
 });
 

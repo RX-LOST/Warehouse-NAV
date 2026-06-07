@@ -15,6 +15,7 @@ export const GLB_DIR = path.join(DATA_DIR, "glbs");
 export const PHOTO_DIR = path.join(DATA_DIR, "photos");
 export const CONFIG_DIR = path.join(DATA_DIR, "configs");
 export const AUTH_DIR = path.join(DATA_DIR, "auth");
+export const STAGING_DIR = path.join(DATA_DIR, "staging");
 
 export const MAX_FILE_SIZE = 512 * 1024 * 1024;
 export const TOKEN_TTL_MS = 8 * 60 * 60 * 1000;

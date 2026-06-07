@@ -64,7 +64,7 @@ const STORAGE_KEY = "warehouse-router-config";
 // In Replit dev, the proxy routes /api to the backend.
 const API_BASE = "/api";
 
-async function uploadFile(file: File, type: "glb" | "photo"): Promise<string> {
+async function uploadFile(file: File, type: "glb" | "photo" | "splat"): Promise<string> {
   const endpoint = `${API_BASE}/upload`;
   const form = new FormData();
   form.append("file", file);
@@ -1567,6 +1567,22 @@ export default function App() {
       .finally(() => setUploading(false));
   }
 
+  function onSplatUpload(file: File) {
+    setUploading(true);
+    setStatusMsg("Uploading splat...");
+    uploadFile(file, "splat")
+      .then((url) => {
+        setConfig((c) => ({ ...c, splatUrl: url }));
+        setStatusMsg("Splat uploaded and loaded.");
+      })
+      .catch((e) => {
+        const url = URL.createObjectURL(file);
+        setConfig((c) => ({ ...c, splatUrl: url }));
+        setStatusMsg(`Server upload failed (${e.message}), loaded locally.`);
+      })
+      .finally(() => setUploading(false));
+  }
+
   // ---------- Auth ----------
   async function loginAdmin() {
     setPasswordError("");
@@ -1631,6 +1647,7 @@ export default function App() {
     const cleaned: Config = {
       ...data,
       glbUrl: data.glbUrl?.startsWith("blob:") ? null : data.glbUrl,
+      splatUrl: data.splatUrl?.startsWith("blob:") ? null : data.splatUrl,
       shelves: Object.fromEntries(
         Object.entries(data.shelves).map(([k, s]) => [k, { ...s, panoramaUrl: s.panoramaUrl?.startsWith("blob:") ? null : s.panoramaUrl }])
       ),
@@ -1643,9 +1660,18 @@ export default function App() {
         body: JSON.stringify({ name, config: cleaned }),
       });
       const d = await r.json();
-      setStatusMsg(`Config saved as "${d.name}".`);
+      if (!r.ok) {
+        setStatusMsg(`Save failed: ${d.error ?? "Unknown error"}`);
+        return;
+      }
+      if (d.config) {
+        setConfig(d.config);
+        setLoadedConfigHash(JSON.stringify(d.config));
+      } else {
+        setLoadedConfigHash(JSON.stringify(data));
+      }
       setLoadedConfigName(name);
-      setLoadedConfigHash(JSON.stringify(data));
+      setStatusMsg(`Config saved as "${d.name}".`);
       await fetchServerConfigs();
     } catch (e: unknown) {
       setStatusMsg(`Save failed: ${(e as Error).message}`);
@@ -2434,6 +2460,7 @@ export default function App() {
               setRotationPreset={setRotationPreset}
               onGlbUpload={onGlbUpload}
               onPanoUpload={onPanoUpload}
+              onSplatUpload={onSplatUpload}
               exportConfig={exportConfig}
               importConfig={importConfig}
               mode={mode}
@@ -2814,6 +2841,7 @@ function AdminPanel(props: {
   setRotationPreset: () => void;
   onGlbUpload: (f: File) => void;
   onPanoUpload: (f: File) => void;
+  onSplatUpload: (f: File) => void;
   exportConfig: () => void;
   importConfig: (f: File) => void;
   mode: AppMode;
@@ -2878,6 +2906,7 @@ function AdminPanel(props: {
     setRotationPreset,
     onGlbUpload,
     onPanoUpload,
+    onSplatUpload,
     exportConfig,
     importConfig,
     mode,
@@ -2963,24 +2992,42 @@ function AdminPanel(props: {
         </span>
       </div>
 
-      {/* Gaussian splat URL */}
+      {/* Gaussian splat file upload */}
       <div style={{ marginTop: 6 }}>
-        <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>Gaussian Splat URL (.ksplat / .splat)</div>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>Gaussian Splat (.ksplat / .splat)</div>
         <div className="row" style={{ gap: 4 }}>
-          <input
-            style={{ flex: 1, fontSize: 11 }}
-            placeholder="https://…/scene.ksplat"
-            value={config.splatUrl ?? ""}
-            onChange={(e) =>
-              setConfig((c) => ({ ...c, splatUrl: e.target.value || null }))
-            }
-          />
+          <label
+            style={{
+              display: "inline-block",
+              background: "#2563eb",
+              border: "1px solid #2563eb",
+              color: "#fff",
+              padding: "6px 10px",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 12,
+              textTransform: "none",
+              letterSpacing: 0,
+              fontWeight: 500,
+            }}
+          >
+            Upload Splat
+            <input
+              type="file"
+              accept=".ksplat,.splat"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) onSplatUpload(f);
+              }}
+            />
+          </label>
           {config.splatUrl && (
             <button
               style={{ fontSize: 11, padding: "3px 7px" }}
               className="danger"
               onClick={() => setConfig((c) => ({ ...c, splatUrl: null }))}
-            >✕</button>
+            >Remove</button>
           )}
         </div>
       </div>

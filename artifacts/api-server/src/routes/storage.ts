@@ -1,54 +1,38 @@
 import { Router } from "express";
-import fs from "node:fs";
+import { saveToStaging, getStagingFilePath, upload } from "../services/fileStore.js";
 import path from "node:path";
-import { upload, saveUpload, getFilePath, listFiles } from "../services/fileStore.js";
 
 const router = Router();
 
-router.get("/files/glbs", (_req, res) => {
-  res.json({ files: listFiles("glbs") });
-});
-
-router.get("/files/photos", (_req, res) => {
-  res.json({ files: listFiles("photos") });
-});
-
-router.get("/files/glbs/:file", (req, res) => {
-  const filePath = getFilePath(req.params["file"]!, "glbs");
-  if (!filePath) {
-    res.status(404).json({ error: "Not Found", message: "File not found" });
-    return;
-  }
-  const ext = path.extname(filePath).toLowerCase();
-  const mime = ext === ".glb" ? "model/gltf-binary" : "application/octet-stream";
-  res.type(mime).sendFile(filePath);
-});
-
-router.get("/files/photos/:file", (req, res) => {
-  const filePath = getFilePath(req.params["file"]!, "photos");
-  if (!filePath) {
-    res.status(404).json({ error: "Not Found", message: "File not found" });
-    return;
-  }
-  const mimeMap: Record<string, string> = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-  };
-  const ext = path.extname(filePath).toLowerCase();
-  res.type(mimeMap[ext] ?? "application/octet-stream").sendFile(filePath);
-});
+const MIME_MAP: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".glb": "model/gltf-binary",
+  ".gltf": "model/gltf+json",
+  ".ksplat": "application/octet-stream",
+  ".splat": "application/octet-stream",
+};
 
 router.post("/upload", upload.single("file"), (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "Bad Request", message: "No file uploaded" });
     return;
   }
-  const filename = saveUpload(req.file.originalname, req.file.buffer);
-  const isGlb = filename.endsWith(".glb");
-  res.json({ url: `/api/files/${isGlb ? "glbs" : "photos"}/${filename}`, filename });
+  const filename = saveToStaging(req.file.originalname, req.file.buffer);
+  res.json({ url: `/api/staging/${filename}`, filename });
+});
+
+router.get("/staging/:file", (req, res) => {
+  const filePath = getStagingFilePath(req.params["file"]!);
+  if (!filePath) {
+    res.status(404).json({ error: "Not Found", message: "File not found" });
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  res.type(MIME_MAP[ext] ?? "application/octet-stream").sendFile(filePath);
 });
 
 export default router;
