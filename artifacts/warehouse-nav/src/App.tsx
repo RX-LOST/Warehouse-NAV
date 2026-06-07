@@ -311,6 +311,26 @@ export default function App() {
     saveConfig(config);
   }, [config]);
 
+  // Load default server config on every page load
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/configs/default`)
+      .then((r) => {
+        if (!r.ok) throw new Error("No default config");
+        return r.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const loaded = { ...defaultConfig, ...data } as Config;
+        setConfig(loaded);
+        setLoadedConfigName("default");
+        setLoadedConfigHash(JSON.stringify(loaded));
+        setStatusMsg(`Default config loaded from server.`);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
   // ---------- Three.js Setup ----------
   useEffect(() => {
     const mount = mountRef.current;
@@ -1460,6 +1480,23 @@ export default function App() {
     fetchServerConfigs();
   }, []);
 
+  // Fetch the active config from the server on page load and apply it as default
+  useEffect(() => {
+    fetch(`${API_BASE}/configs/active`)
+      .then((r) => {
+        if (!r.ok) return null;
+        return r.json();
+      })
+      .then((data) => {
+        if (!data) return;
+        const active = { ...defaultConfig, ...data } as Config;
+        setConfig(active);
+        setLoadedConfigName(data.name ?? null);
+        setLoadedConfigHash(JSON.stringify(active));
+      })
+      .catch(() => {});
+  }, []);
+
   function onGlbUpload(file: File) {
     setUploading(true);
     setStatusMsg("Uploading GLB...");
@@ -1593,6 +1630,16 @@ export default function App() {
     }
   }
 
+  async function setActiveConfig(name: string) {
+    try {
+      await fetch(`${API_BASE}/configs/active`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+    } catch {}
+  }
+
   async function saveConfigToServer(name: string, configToSave?: Config) {
     const data = configToSave ?? config;
     const cleaned: Config = {
@@ -1613,10 +1660,12 @@ export default function App() {
       setStatusMsg(`Config saved as "${d.name}".`);
       setLoadedConfigName(name);
       setLoadedConfigHash(JSON.stringify(data));
+      setActiveConfig(name);
       await fetchServerConfigs();
     } catch (e: unknown) {
       setStatusMsg(`Save failed: ${(e as Error).message}`);
     }
+  }
   }
 
   function loadConfigFromServer(name: string) {
@@ -1627,6 +1676,7 @@ export default function App() {
         setConfig(loaded);
         setLoadedConfigName(name);
         setLoadedConfigHash(JSON.stringify(loaded));
+        setActiveConfig(name);
         setStatusMsg(`Config "${name}" loaded from server.`);
       })
       .catch((e) => setStatusMsg(`Load failed: ${e.message}`));
@@ -1687,6 +1737,7 @@ export default function App() {
       setConfig(loadModalData);
       setLoadedConfigName(loadModalName);
       setLoadedConfigHash(JSON.stringify(loadModalData));
+      setActiveConfig(loadModalName);
       setShowLoadModal(false);
       setStatusMsg(`Config "${loadModalName}" loaded.`);
     } else {
@@ -1717,6 +1768,7 @@ export default function App() {
     setConfig(partialMergeResult);
     setLoadedConfigName(name);
     setLoadedConfigHash(JSON.stringify(partialMergeResult));
+    setActiveConfig(name);
     setShowPartialNamePrompt(false);
     setPartialMergeResult(null);
     setStatusMsg(`Created config "${name}" with merged settings.`);
