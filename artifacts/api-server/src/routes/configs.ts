@@ -6,12 +6,8 @@ const router = Router();
 
 router.get("/configs", (_req, res) => {
   const files = listFiles("configs").filter((f) => f.endsWith(".json"));
-  const configs = files.map((f) => {
-    const name = f.replace(/\.json$/, "");
-    const data = readJSONFile<Record<string, unknown>>(f);
-    return { name, ...data };
-  });
-  res.json({ configs });
+  const names = files.map((f) => f.replace(/\.json$/, ""));
+  res.json({ configs: names });
 });
 
 router.get("/configs/:name", (req, res) => {
