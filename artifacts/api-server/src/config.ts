@@ -18,3 +18,5 @@ export const AUTH_DIR = path.join(DATA_DIR, "auth");
 
 export const MAX_FILE_SIZE = 512 * 1024 * 1024;
 export const TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
+
+export const FRONTEND_DIST = path.resolve(APP_ROOT, "..", "warehouse-nav", "dist", "public");
