@@ -48,7 +48,7 @@ export default function NodeGraphView({
       const v = viewRef.current;
       return {
         cx: pos.x * v.scale + v.ox,
-        cy: -pos.z * v.scale + v.oy, // flip Z for top-down view
+        cy: pos.z * v.scale + v.oy,
       };
     },
     [],
@@ -59,7 +59,7 @@ export default function NodeGraphView({
     return {
       x: (cx - v.ox) / v.scale,
       y: 0,
-      z: -(cy - v.oy) / v.scale,
+      z: (cy - v.oy) / v.scale,
     };
   }, []);
 
@@ -80,7 +80,7 @@ export default function NodeGraphView({
     viewRef.current = {
       scale,
       ox: cw / 2 - ((minX + maxX) / 2) * scale,
-      oy: ch / 2 + ((minZ + maxZ) / 2) * scale,
+      oy: ch / 2 - ((minZ + maxZ) / 2) * scale,
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -99,8 +99,8 @@ export default function NodeGraphView({
     const gridStep = v.scale >= 20 ? 1 : 5;
     const startX = Math.floor(-v.ox / v.scale / gridStep) * gridStep;
     const endX = Math.ceil((cw - v.ox) / v.scale / gridStep) * gridStep;
-    const startZ = Math.floor((v.oy - ch) / v.scale / gridStep) * gridStep;
-    const endZ = Math.ceil(v.oy / v.scale / gridStep) * gridStep;
+    const startZ = Math.floor((-v.oy) / v.scale / gridStep) * gridStep;
+    const endZ = Math.ceil((ch - v.oy) / v.scale / gridStep) * gridStep;
     ctx.strokeStyle = GRID_COLOR;
     ctx.lineWidth = 0.5;
     for (let wx = startX; wx <= endX; wx += gridStep) {
@@ -108,7 +108,7 @@ export default function NodeGraphView({
       ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, ch); ctx.stroke();
     }
     for (let wz = startZ; wz <= endZ; wz += gridStep) {
-      const cy = -wz * v.scale + v.oy;
+      const cy = wz * v.scale + v.oy;
       ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(cw, cy); ctx.stroke();
     }
 
