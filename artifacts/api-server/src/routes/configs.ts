@@ -2,8 +2,6 @@ import { Router } from "express";
 import fs from "node:fs";
 import { CONFIG_DIR } from "../config.js";
 import { listFiles, readJSONFile } from "../services/fileStore.js";
-import { requireToken } from "../middleware/auth.js";
-
 const router = Router();
 
 router.get("/configs", (_req, res) => {
@@ -27,17 +25,16 @@ router.get("/configs/:name", (req, res) => {
   res.json({ name, ...data });
 });
 
-router.post("/configs", requireToken, (req, res) => {
-  const { name, positions, shelves } = req.body ?? {};
+router.post("/configs", (req, res) => {
+  const { name, config: bodyConfig } = req.body ?? {};
   if (!name || typeof name !== "string") {
     res.status(400).json({ error: "Bad Request", message: "Config name is required" });
     return;
   }
-  const config = { positions: positions ?? [], shelves: shelves ?? [] };
   const filename = name.endsWith(".json") ? name : `${name}.json`;
   const dir = CONFIG_DIR;
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(config, null, 2), "utf8");
+  fs.writeFileSync(`${dir}/${filename}`, JSON.stringify(bodyConfig ?? {}, null, 2), "utf8");
   res.json({ success: true, name });
 });
 

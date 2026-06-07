@@ -41,22 +41,14 @@ router.get("/files/photos/:file", (req, res) => {
   res.type(mimeMap[ext] ?? "application/octet-stream").sendFile(filePath);
 });
 
-router.post("/files/upload-glb", upload.single("file"), (req, res) => {
+router.post("/upload", upload.single("file"), (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "Bad Request", message: "No file uploaded" });
     return;
   }
   const filename = saveUpload(req.file.originalname, req.file.buffer);
-  res.json({ url: `/api/files/glbs/${filename}`, filename });
-});
-
-router.post("/files/upload-photo", upload.single("file"), (req, res) => {
-  if (!req.file) {
-    res.status(400).json({ error: "Bad Request", message: "No file uploaded" });
-    return;
-  }
-  const filename = saveUpload(req.file.originalname, req.file.buffer);
-  res.json({ url: `/api/files/photos/${filename}`, filename });
+  const isGlb = filename.endsWith(".glb");
+  res.json({ url: `/api/files/${isGlb ? "glbs" : "photos"}/${filename}`, filename });
 });
 
 export default router;
