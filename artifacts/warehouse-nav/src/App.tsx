@@ -2552,8 +2552,9 @@ export default function App() {
               setNewPasswordInput={setNewPasswordInput}
               changePassword={changePassword}
               passwordError={passwordError}
-              setPasswordError={setPasswordError}
-            />
+               setPasswordError={setPasswordError}
+               setCameraFov={setCameraFov}
+             />
           )}
 
           {panel === "runtime" && (
@@ -2934,6 +2935,7 @@ function AdminPanel(props: {
   changePassword: () => void;
   passwordError: string;
   setPasswordError: (v: string) => void;
+  setCameraFov: (v: number) => void;
 }) {
   const {
     config,
@@ -2999,6 +3001,7 @@ function AdminPanel(props: {
     changePassword,
     passwordError,
     setPasswordError,
+    setCameraFov,
   } = props;
   const [renameShelfId, setRenameShelfId] = useState("");
   const [renameShelfBarcode, setRenameShelfBarcode] = useState("");
