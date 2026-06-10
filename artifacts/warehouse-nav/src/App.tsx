@@ -22,6 +22,7 @@ type Shelf = {
   panoramaYaw: number;
   panoramaPitch: number;
   panoramaFov: number;
+  sceneFov: number;
   markerYaw: number | null;
   markerPitch: number | null;
 };
@@ -46,6 +47,7 @@ type Config = {
   objects: SceneObject[];
   homePosition: Vec3;
   homeLookAt: Vec3;
+  homeFov: number;
   homeNodeId: string | null;        // path node linked to home position
   pathNodes: Record<string, PathNode>;
   cameraSpeed: number;              // units per second (default 3)
@@ -90,6 +92,7 @@ const defaultConfig: Config = {
   objects: [],
   homePosition: { x: 0, y: 2, z: 5 },
   homeLookAt: { x: 0, y: 1, z: 0 },
+  homeFov: 60,
   homeNodeId: null,
   pathNodes: {},
   cameraSpeed: 3,
@@ -109,7 +112,7 @@ function loadConfig(): Config {
           const old = s as Record<string, unknown>;
           // If it's already new format, keep it
           if (old.cameraPosition) {
-            return [k, { panoramaYaw: 0, panoramaPitch: 0, panoramaFov: 75, markerYaw: null, markerPitch: null, cameraLookAt: null, ...old } as Shelf];
+            return [k, { panoramaYaw: 0, panoramaPitch: 0, panoramaFov: 75, sceneFov: 60, markerYaw: null, markerPitch: null, cameraLookAt: null, ...old } as Shelf];
           }
           // Migrate from old waypoints-based format
           const wps = (old.waypoints as Vec3[] | undefined) ?? [];
@@ -123,6 +126,7 @@ function loadConfig(): Config {
             panoramaYaw: Number(old.panoramaYaw ?? 0),
             panoramaPitch: Number(old.panoramaPitch ?? 0),
             panoramaFov: Number(old.panoramaFov ?? 75),
+            sceneFov: Number(old.sceneFov ?? 60),
             markerYaw: (old.markerYaw as number | null) ?? null,
             markerPitch: (old.markerPitch as number | null) ?? null,
           };
@@ -137,6 +141,7 @@ function loadConfig(): Config {
       if (!merged.cameraSpeed || merged.cameraSpeed <= 0) merged.cameraSpeed = 3;
       if (!merged.homeNodeId) merged.homeNodeId = null;
       if (!merged.splatUrl) merged.splatUrl = null;
+      if (!merged.homeFov) merged.homeFov = 60;
 
       return merged;
     }
@@ -294,6 +299,11 @@ export default function App() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  const panelRef = useRef<"admin" | "runtime">(panel);
+  useEffect(() => {
+    panelRef.current = panel;
+  }, [panel]);
 
   const activeShelfIdRef = useRef<string | null>(activeShelfId);
   useEffect(() => {
@@ -642,7 +652,7 @@ export default function App() {
   useEffect(() => {
     renderNodeVisualization();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config.pathNodes, config.homeNodeId, mode, activeShelfId]);
+  }, [config.pathNodes, config.homeNodeId, mode, activeShelfId, panel]);
 
   function renderNodeVisualization() {
     const scene = sceneRef.current;
@@ -663,9 +673,10 @@ export default function App() {
     }
 
     const isAdmin =
-      modeRef.current === "admin-free" ||
+      panelRef.current !== "runtime" &&
+      (modeRef.current === "admin-free" ||
       modeRef.current === "admin-node-edit" ||
-      modeRef.current === "admin-pano-edit";
+      modeRef.current === "admin-pano-edit");
     if (!isAdmin) return;
 
     const nodes = config.pathNodes;
@@ -799,7 +810,7 @@ export default function App() {
     if (navRef.current.active) return;
     const m = modeRef.current;
     const adminFree = m === "admin-free" || m === "admin-node-edit";
-    if (!adminFree) return;
+    if (!adminFree || panelRef.current === "runtime") return;
 
     const speed = (keysRef.current["ShiftLeft"] ? 8 : 3) * dt;
 
@@ -830,7 +841,22 @@ export default function App() {
     const dom = renderer.domElement;
     const onMouseDown = (e: MouseEvent) => {
       const m = modeRef.current;
-      if (m !== "admin-free" && m !== "admin-node-edit") return;
+      const p = panelRef.current;
+      const inAdmin = m === "admin-free" || m === "admin-node-edit";
+
+      // Runtime panel: left-click drag rotates camera
+      if (p === "runtime") {
+        if (e.button === 0) {
+          e.preventDefault();
+          cameraRotateRef.current = true;
+          setIsRightDragging(true);
+          dom.requestPointerLock();
+        }
+        return;
+      }
+
+      // Admin mode: only when in an admin 3D mode
+      if (!inAdmin) return;
       // While a transform gesture is active: LMB confirms, RMB cancels
       if (transformRef.current.active) {
         e.preventDefault();
@@ -862,7 +888,10 @@ export default function App() {
       }
     };
     const onMouseUp = (e: MouseEvent) => {
-      if (e.button === 2 && cameraRotateRef.current) {
+      if (!cameraRotateRef.current) return;
+      const p = panelRef.current;
+      // Stop on LMB release (runtime) or RMB release (admin)
+      if ((p === "runtime" && e.button === 0) || (p !== "runtime" && e.button === 2)) {
         cameraRotateRef.current = false;
         setIsRightDragging(false);
         if (document.pointerLockElement === dom) document.exitPointerLock();
@@ -876,7 +905,10 @@ export default function App() {
       isPointerLockedRef.current = document.pointerLockElement === dom;
       // If lock was lost externally (Esc), clean up state
       if (!isPointerLockedRef.current) {
-        if (cameraRotateRef.current) cameraRotateRef.current = false;
+        if (cameraRotateRef.current) {
+          cameraRotateRef.current = false;
+          setIsRightDragging(false);
+        }
       }
     };
     const onMouseMove = (e: MouseEvent) => {
@@ -912,7 +944,8 @@ export default function App() {
     };
     const onWheel = (e: WheelEvent) => {
       const m = modeRef.current;
-      if (m !== "admin-free" && m !== "admin-node-edit") return;
+      const p = panelRef.current;
+      if ((m !== "admin-free" && m !== "admin-node-edit") && p !== "runtime") return;
       const cam = cameraRef.current;
       if (!cam) return;
       e.preventDefault();
@@ -1312,6 +1345,7 @@ export default function App() {
     const dir = new THREE.Vector3();
     cam?.getWorldDirection(dir);
     const lookAt = cam ? toV3(cam.position.clone().add(dir.multiplyScalar(3))) : { x: 0, y: 1.6, z: -3 };
+    const currentFov = cam ? cam.fov : 60;
     const shelf: Shelf = {
       id,
       barcode: newShelfBarcode.trim(),
@@ -1321,6 +1355,7 @@ export default function App() {
       panoramaYaw: 0,
       panoramaPitch: 0,
       panoramaFov: 75,
+      sceneFov: currentFov,
       markerYaw: null,
       markerPitch: null,
     };
@@ -1350,15 +1385,16 @@ export default function App() {
     const dir = new THREE.Vector3();
     cam.getWorldDirection(dir);
     const lookAt = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
+    const fov = cam.fov;
     setConfig((c) => {
       const shelf = c.shelves[id];
       if (!shelf) return c;
       return {
         ...c,
-        shelves: { ...c.shelves, [id]: { ...shelf, cameraPosition: pos, cameraLookAt: lookAt } },
+        shelves: { ...c.shelves, [id]: { ...shelf, cameraPosition: pos, cameraLookAt: lookAt, sceneFov: fov } },
       };
     });
-    setStatusMsg(`Shelf "${id}" pose saved.`);
+    setStatusMsg(`Shelf "${id}" pose saved (FOV: ${fov.toFixed(0)}°).`);
   }
   // keep addWaypointRef compat (now saves shelf pose)
   addWaypointRef.current = saveShelfPose;
@@ -1377,6 +1413,8 @@ export default function App() {
       pitchRef.current = Math.asin(Math.max(-1, Math.min(1, dir.y)));
       applyCameraRotation();
     }
+    cam.fov = Math.max(20, Math.min(110, shelf.sceneFov ?? 60));
+    cam.updateProjectionMatrix();
     setStatusMsg(`Teleported to shelf "${shelfId}".`);
   }
 
@@ -1457,8 +1495,9 @@ export default function App() {
     const dir = new THREE.Vector3();
     cam.getWorldDirection(dir);
     const lookAt = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
-    setConfig((c) => ({ ...c, homePosition: pos, homeLookAt: lookAt }));
-    setStatusMsg("Home position updated.");
+    const fov = cam.fov;
+    setConfig((c) => ({ ...c, homePosition: pos, homeLookAt: lookAt, homeFov: fov }));
+    setStatusMsg(`Home position updated (FOV: ${fov.toFixed(0)}°).`);
   }
 
   function gotoHome() {
@@ -1474,10 +1513,15 @@ export default function App() {
       yawRef.current = Math.atan2(-dir.x, -dir.z);
       pitchRef.current = Math.asin(dir.y);
       applyCameraRotation();
+      cam.fov = Math.max(20, Math.min(110, config.homeFov ?? 60));
+      cam.updateProjectionMatrix();
       return;
     }
-    startNavigation(to, config.homeLookAt, () => setMode("admin-free"),
-      null, config.homeNodeId ?? null);
+    startNavigation(to, config.homeLookAt, () => {
+      const c = cameraRef.current;
+      if (c) { c.fov = Math.max(20, Math.min(110, config.homeFov ?? 60)); c.updateProjectionMatrix(); }
+      setMode("admin-free");
+    }, null, config.homeNodeId ?? null);
   }
 
   // ---------- File handling ----------
@@ -1931,6 +1975,11 @@ export default function App() {
       match.cameraPosition,
       match.cameraLookAt ?? null,
       () => {
+        const cam = cameraRef.current;
+        if (cam && match.sceneFov) {
+          cam.fov = Math.max(20, Math.min(110, match.sceneFov));
+          cam.updateProjectionMatrix();
+        }
         if (match.panoramaUrl) {
           enterPanorama(match);
         } else {
@@ -3136,6 +3185,23 @@ function AdminPanel(props: {
         <button onClick={setHomeFromCamera}>Set From Camera</button>
         <button onClick={gotoHome}>Go to Home</button>
       </div>
+      <label className="muted" style={{ display: "block", marginTop: 4 }}>
+        FOV: {config.homeFov.toFixed(0)}°
+        <input
+          type="range"
+          min={20}
+          max={110}
+          step={1}
+          value={config.homeFov}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            const cam = cameraRef.current;
+            if (cam) { cam.fov = v; cam.updateProjectionMatrix(); }
+            setConfig((c) => ({ ...c, homeFov: v }));
+          }}
+          style={{ width: "100%" }}
+        />
+      </label>
 
       <div className="divider" />
 
@@ -3290,6 +3356,27 @@ function AdminPanel(props: {
                   ? `Pos: (${activeShelf.cameraPosition.x.toFixed(1)}, ${activeShelf.cameraPosition.y.toFixed(1)}, ${activeShelf.cameraPosition.z.toFixed(1)})`
                   : "No pose saved yet"}
               </div>
+              <label className="muted" style={{ display: "block", marginTop: 4 }}>
+                FOV: {activeShelf.sceneFov?.toFixed(0) ?? 60}°
+                <input
+                  type="range"
+                  min={20}
+                  max={110}
+                  step={1}
+                  value={activeShelf.sceneFov ?? 60}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    const cam = cameraRef.current;
+                    if (cam) { cam.fov = v; cam.updateProjectionMatrix(); }
+                    setConfig((c) => {
+                      const shelf = c.shelves[activeShelf.id];
+                      if (!shelf) return c;
+                      return { ...c, shelves: { ...c.shelves, [activeShelf.id]: { ...shelf, sceneFov: v } } };
+                    });
+                  }}
+                  style={{ width: "100%" }}
+                />
+              </label>
             </div>
           )}
 
