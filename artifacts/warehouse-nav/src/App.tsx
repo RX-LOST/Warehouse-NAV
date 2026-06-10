@@ -1487,6 +1487,12 @@ export default function App() {
     setStatusMsg(`Home node set to "${id}".`);
   }
 
+  // ---------- FOV helper ----------
+  function setCameraFov(v: number) {
+    const cam = cameraRef.current;
+    if (cam) { cam.fov = Math.max(20, Math.min(110, v)); cam.updateProjectionMatrix(); }
+  }
+
   // ---------- Home helpers ----------
   function setHomeFromCamera() {
     const cam = cameraRef.current;
@@ -3195,8 +3201,7 @@ function AdminPanel(props: {
           value={config.homeFov}
           onChange={(e) => {
             const v = parseFloat(e.target.value);
-            const cam = cameraRef.current;
-            if (cam) { cam.fov = v; cam.updateProjectionMatrix(); }
+            setCameraFov(v);
             setConfig((c) => ({ ...c, homeFov: v }));
           }}
           style={{ width: "100%" }}
@@ -3366,8 +3371,7 @@ function AdminPanel(props: {
                   value={activeShelf.sceneFov ?? 60}
                   onChange={(e) => {
                     const v = parseFloat(e.target.value);
-                    const cam = cameraRef.current;
-                    if (cam) { cam.fov = v; cam.updateProjectionMatrix(); }
+                    setCameraFov(v);
                     setConfig((c) => {
                       const shelf = c.shelves[activeShelf.id];
                       if (!shelf) return c;
