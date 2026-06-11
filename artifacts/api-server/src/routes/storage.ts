@@ -14,6 +14,7 @@ const MIME_MAP: Record<string, string> = {
   ".gltf": "model/gltf+json",
   ".ksplat": "application/octet-stream",
   ".splat": "application/octet-stream",
+  ".ply": "application/octet-stream",
 };
 
 router.post("/upload", upload.single("file"), (req, res) => {

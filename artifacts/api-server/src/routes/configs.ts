@@ -78,6 +78,7 @@ router.get("/configs/files/:name/:type/:filename", (req, res) => {
     ".gltf": "model/gltf+json",
     ".ksplat": "application/octet-stream",
     ".splat": "application/octet-stream",
+    ".ply": "application/octet-stream",
   };
   res.type(mimeMap[ext] ?? "application/octet-stream").sendFile(filePath);
 });

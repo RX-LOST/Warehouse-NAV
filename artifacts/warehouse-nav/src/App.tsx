@@ -449,6 +449,7 @@ export default function App() {
         glbRootRef.current = gltf.scene;
         applyTransformToObject(gltf.scene, config.glbTransform);
         scene.add(gltf.scene);
+        if (splatReadyRef.current) gltf.scene.visible = false;
         updateSelectionBox();
         setStatusMsg("GLB loaded.");
       },
@@ -465,6 +466,7 @@ export default function App() {
   // ---------- Gaussian splat loading ----------
   const splatRootRef = useRef<THREE.Object3D | null>(null);
   const splatViewerRef = useRef<{ dispose?: () => void } | null>(null);
+  const splatReadyRef = useRef(false);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -481,6 +483,8 @@ export default function App() {
       splatViewerRef.current.dispose();
       splatViewerRef.current = null;
     }
+    splatReadyRef.current = false;
+    if (glbRootRef.current) glbRootRef.current.visible = true;
     if (!config.splatUrl) return;
 
     // Device capability check: require WebGL2 + reasonable GPU
@@ -505,6 +509,8 @@ export default function App() {
       splatViewerRef.current = viewer;
       viewer.addSplatScene(config.splatUrl!, { showLoadingUI: false })
         .then(() => {
+          splatReadyRef.current = true;
+          if (glbRootRef.current) glbRootRef.current.visible = false;
           setStatusMsg("Gaussian splat loaded.");
         })
         .catch((err: unknown) => {
@@ -3075,7 +3081,7 @@ function AdminPanel(props: {
 
       {/* Gaussian splat file upload */}
       <div style={{ marginTop: 6 }}>
-        <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>Gaussian Splat (.ksplat / .splat)</div>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>Gaussian Splat (.ksplat / .splat / .ply)</div>
         <div className="row" style={{ gap: 4 }}>
           <label
             style={{
@@ -3095,7 +3101,7 @@ function AdminPanel(props: {
             Upload Splat
             <input
               type="file"
-              accept=".ksplat,.splat"
+              accept=".ksplat,.splat,.ply"
               style={{ display: "none" }}
               onChange={(e) => {
                 const f = e.target.files?.[0];
