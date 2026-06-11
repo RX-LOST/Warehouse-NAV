@@ -844,13 +844,14 @@ export default function App() {
       const p = panelRef.current;
       const inAdmin = m === "admin-free" || m === "admin-node-edit";
 
-      // Runtime panel: left-click drag rotates camera
+      // Runtime panel: left-click drag rotates camera (simple drag, no pointer lock)
       if (p === "runtime") {
         if (e.button === 0) {
           e.preventDefault();
+          lastMouseRef.current.x = e.clientX;
+          lastMouseRef.current.y = e.clientY;
           cameraRotateRef.current = true;
           setIsRightDragging(true);
-          dom.requestPointerLock();
         }
         return;
       }
@@ -894,7 +895,7 @@ export default function App() {
       if ((p === "runtime" && e.button === 0) || (p !== "runtime" && e.button === 2)) {
         cameraRotateRef.current = false;
         setIsRightDragging(false);
-        if (document.pointerLockElement === dom) document.exitPointerLock();
+        if (p !== "runtime" && document.pointerLockElement === dom) document.exitPointerLock();
       }
     };
     const onContextMenu = (e: MouseEvent) => {
@@ -912,6 +913,21 @@ export default function App() {
       }
     };
     const onMouseMove = (e: MouseEvent) => {
+      // Runtime simple drag (no pointer lock)
+      if (cameraRotateRef.current && panelRef.current === "runtime") {
+        const dx = e.clientX - lastMouseRef.current.x;
+        const dy = e.clientY - lastMouseRef.current.y;
+        lastMouseRef.current.x = e.clientX;
+        lastMouseRef.current.y = e.clientY;
+        yawRef.current -= dx * 0.0025;
+        pitchRef.current -= dy * 0.0025;
+        pitchRef.current = Math.max(
+          -Math.PI / 2 + 0.01,
+          Math.min(Math.PI / 2 - 0.01, pitchRef.current),
+        );
+        applyCameraRotation();
+        return;
+      }
       // Always track real cursor position when not locked
       if (!isPointerLockedRef.current) {
         lastMouseRef.current.x = e.clientX;
@@ -945,7 +961,9 @@ export default function App() {
     const onWheel = (e: WheelEvent) => {
       const m = modeRef.current;
       const p = panelRef.current;
-      if ((m !== "admin-free" && m !== "admin-node-edit") && p !== "runtime") return;
+      // No zoom in runtime
+      if (p === "runtime") return;
+      if (m !== "admin-free" && m !== "admin-node-edit") return;
       const cam = cameraRef.current;
       if (!cam) return;
       e.preventDefault();
@@ -2214,7 +2232,8 @@ export default function App() {
     };
     const onWheel = (e: WheelEvent) => {
       const m = modeRef.current;
-      if (m !== "panorama" && m !== "admin-pano-edit") return;
+      // No zoom in runtime panorama
+      if (m !== "admin-pano-edit") return;
       e.preventDefault();
       panoFovRef.current = Math.max(
         20,
@@ -2571,7 +2590,11 @@ export default function App() {
 
         <div className="panel" style={{ pointerEvents: "auto", maxWidth: 320 }}>
           <h3>Controls</h3>
-          {mode === "admin-free" || mode === "admin-node-edit" ? (
+          {panel === "runtime" ? (
+            <div className="muted" style={{ lineHeight: 1.6 }}>
+              Drag = look around
+            </div>
+          ) : mode === "admin-free" || mode === "admin-node-edit" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
               Right-click drag = look (mouse wraps at edges) · WASD = move ·
               Q/E = down/up · Shift = sprint · Wheel = FOV · Left-click = select
@@ -2582,7 +2605,7 @@ export default function App() {
             </div>
           ) : mode === "panorama" ? (
             <div className="muted" style={{ lineHeight: 1.6 }}>
-              Drag = look around · Wheel = zoom
+              Drag = look around
             </div>
           ) : (
             <div className="muted">Camera in motion...</div>
