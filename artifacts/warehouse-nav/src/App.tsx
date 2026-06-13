@@ -2058,6 +2058,16 @@ export default function App() {
       setStatusMsg(`Shelf "${match.id}" has no saved camera position yet.`);
       return;
     }
+    // If already at this shelf's position, return home instead
+    const cam = cameraRef.current;
+    if (cam) {
+      const dist = cam.position.distanceTo(fromV3(match.cameraPosition));
+      if (dist < 0.1) {
+        setStatusMsg(`Already at ${match.id}. Returning home.`);
+        returnHome();
+        return;
+      }
+    }
     setActiveShelfId(match.id);
     startNavigation(
       match.cameraPosition,
@@ -3824,6 +3834,7 @@ function RuntimePanel(props: {
         onSubmit={(e) => {
           e.preventDefault();
           run(query);
+          setQuery("");
         }}
         style={{ display: "flex", gap: 6 }}
       >
@@ -3848,7 +3859,7 @@ function RuntimePanel(props: {
             {shelves.map((s) => (
               <button
                 key={s.id}
-                onClick={() => run(s.id)}
+                onClick={() => { run(s.id); setQuery(""); }}
                 disabled={mode === "navigating" || !s.cameraPosition}
                 title={!s.cameraPosition ? "No pose saved" : `Go to ${s.id}`}
               >
