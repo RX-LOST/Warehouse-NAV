@@ -840,6 +840,22 @@ export default function App() {
     if (keysRef.current["KeyQ"]) cam.position.y -= speed;
   }
 
+  // ---------- Disable page scroll ----------
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    html.style.overflow = "hidden";
+    html.style.height = "100%";
+    body.style.overflow = "hidden";
+    body.style.height = "100%";
+    return () => {
+      html.style.overflow = "";
+      html.style.height = "";
+      body.style.overflow = "";
+      body.style.height = "";
+    };
+  }, []);
+
   // ---------- Pointer lock for mouse look ----------
   useEffect(() => {
     const renderer = rendererRef.current;
@@ -976,12 +992,50 @@ export default function App() {
       cam.fov = Math.max(20, Math.min(110, cam.fov + e.deltaY * 0.05));
       cam.updateProjectionMatrix();
     };
+    // ---------- Touch handlers for runtime 3D scene ----------
+    const onTouchStart = (e: TouchEvent) => {
+      if (panelRef.current !== "runtime") return;
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        lastMouseRef.current.x = e.touches[0]!.clientX;
+        lastMouseRef.current.y = e.touches[0]!.clientY;
+        cameraRotateRef.current = true;
+        setIsRightDragging(true);
+      }
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!cameraRotateRef.current || panelRef.current !== "runtime") return;
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        const dx = e.touches[0]!.clientX - lastMouseRef.current.x;
+        const dy = e.touches[0]!.clientY - lastMouseRef.current.y;
+        lastMouseRef.current.x = e.touches[0]!.clientX;
+        lastMouseRef.current.y = e.touches[0]!.clientY;
+        yawRef.current -= dx * 0.0025;
+        pitchRef.current -= dy * 0.0025;
+        pitchRef.current = Math.max(
+          -Math.PI / 2 + 0.01,
+          Math.min(Math.PI / 2 - 0.01, pitchRef.current),
+        );
+        applyCameraRotation();
+      }
+    };
+    const onTouchEnd = () => {
+      if (cameraRotateRef.current && panelRef.current === "runtime") {
+        cameraRotateRef.current = false;
+        setIsRightDragging(false);
+      }
+    };
     dom.addEventListener("mousedown", onMouseDown);
     document.addEventListener("mouseup", onMouseUp);
     dom.addEventListener("contextmenu", onContextMenu);
     document.addEventListener("pointerlockchange", onLockChange);
     document.addEventListener("mousemove", onMouseMove);
     dom.addEventListener("wheel", onWheel, { passive: false });
+    dom.addEventListener("touchstart", onTouchStart, { passive: false });
+    dom.addEventListener("touchmove", onTouchMove, { passive: false });
+    dom.addEventListener("touchend", onTouchEnd);
+    dom.addEventListener("touchcancel", onTouchEnd);
     return () => {
       dom.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("mouseup", onMouseUp);
@@ -989,6 +1043,10 @@ export default function App() {
       document.removeEventListener("pointerlockchange", onLockChange);
       document.removeEventListener("mousemove", onMouseMove);
       dom.removeEventListener("wheel", onWheel);
+      dom.removeEventListener("touchstart", onTouchStart);
+      dom.removeEventListener("touchmove", onTouchMove);
+      dom.removeEventListener("touchend", onTouchEnd);
+      dom.removeEventListener("touchcancel", onTouchEnd);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2250,11 +2308,46 @@ export default function App() {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     mount.addEventListener("wheel", onWheel, { passive: false });
+    // Touch handlers for runtime panorama
+    const onTouchStart = (e: TouchEvent) => {
+      if (modeRef.current !== "panorama") return;
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        lx = e.touches[0]!.clientX;
+        ly = e.touches[0]!.clientY;
+        dragging = true;
+      }
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!dragging || modeRef.current !== "panorama") return;
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        const dx = e.touches[0]!.clientX - lx;
+        const dy = e.touches[0]!.clientY - ly;
+        lx = e.touches[0]!.clientX;
+        ly = e.touches[0]!.clientY;
+        panoYawRef.current -= dx * 0.005;
+        panoPitchRef.current -= dy * 0.005;
+        panoPitchRef.current = Math.max(
+          -Math.PI / 2 + 0.01,
+          Math.min(Math.PI / 2 - 0.01, panoPitchRef.current),
+        );
+      }
+    };
+    const onTouchEnd = () => { dragging = false; };
+    mount.addEventListener("touchstart", onTouchStart, { passive: false });
+    mount.addEventListener("touchmove", onTouchMove, { passive: false });
+    mount.addEventListener("touchend", onTouchEnd);
+    mount.addEventListener("touchcancel", onTouchEnd);
     return () => {
       mount.removeEventListener("mousedown", onDown);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       mount.removeEventListener("wheel", onWheel);
+      mount.removeEventListener("touchstart", onTouchStart);
+      mount.removeEventListener("touchmove", onTouchMove);
+      mount.removeEventListener("touchend", onTouchEnd);
+      mount.removeEventListener("touchcancel", onTouchEnd);
     };
   }, []);
 
