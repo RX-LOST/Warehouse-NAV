@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import multer from "multer";
-import { GLB_DIR, PHOTO_DIR, CONFIG_DIR, STAGING_DIR, MAX_FILE_SIZE } from "../config.js";
+import { CONFIG_DIR, STAGING_DIR, MAX_FILE_SIZE } from "../config.js";
 
 // Ensure all base directories exist
-[GLB_DIR, PHOTO_DIR, CONFIG_DIR, STAGING_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
+[CONFIG_DIR, STAGING_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
 
 function sanitizeFilename(name: string): string {
   return path.basename(name).replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -160,11 +160,4 @@ export function getConfigFilePath(configName: string, subdir: string, filename: 
   return p;
 }
 
-// ---------------------------------------------------------------------------
-// Legacy helpers (kept for compatibility; used by health route)
-// ---------------------------------------------------------------------------
-export function legacyListFiles(subpath: "glbs" | "photos" | "configs"): string[] {
-  const dir = subpath === "glbs" ? GLB_DIR : subpath === "photos" ? PHOTO_DIR : CONFIG_DIR;
-  try { return fs.readdirSync(dir); }
-  catch { return []; }
-}
+
