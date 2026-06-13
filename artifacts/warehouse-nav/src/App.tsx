@@ -27,6 +27,12 @@ type Shelf = {
   markerPitch: number | null;
 };
 
+type Area = {
+  id: string;
+  cameraPosition: Vec3;
+  cameraLookAt: Vec3 | null;
+};
+
 type Transform = {
   position: Vec3;
   rotation: Vec3; // degrees
@@ -52,6 +58,7 @@ type Config = {
   pathNodes: Record<string, PathNode>;
   cameraSpeed: number;              // units per second (default 3)
   shelves: Record<string, Shelf>;
+  areas: Record<string, Area>;
 };
 
 type AppMode = "admin-free" | "admin-node-edit" | "admin-pano-edit" | "navigating" | "panorama";
@@ -97,6 +104,7 @@ const defaultConfig: Config = {
   pathNodes: {},
   cameraSpeed: 3,
   shelves: {},
+  areas: {},
 };
 
 function loadConfig(): Config {
@@ -142,6 +150,7 @@ function loadConfig(): Config {
       if (!merged.homeNodeId) merged.homeNodeId = null;
       if (!merged.splatUrl) merged.splatUrl = null;
       if (!merged.homeFov) merged.homeFov = 60;
+      if (!merged.areas) merged.areas = {};
 
       return merged;
     }
@@ -1530,6 +1539,60 @@ export default function App() {
     setStatusMsg(`Shelf updated.`);
   }
 
+  // ---------- Area management ----------
+  function createArea() {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    const pos = toV3(cam.position);
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const lookAt = toV3(cam.position.clone().add(dir.multiplyScalar(3)));
+    const id = `Area ${Object.keys(config.areas).length + 1}`;
+    const area: Area = { id, cameraPosition: pos, cameraLookAt: lookAt };
+    setConfig((c) => ({ ...c, areas: { ...c.areas, [id]: area } }));
+    setStatusMsg(`Area "${id}" created.`);
+  }
+
+  function deleteArea(id: string) {
+    setConfig((c) => {
+      const next = { ...c.areas };
+      delete next[id];
+      return { ...c, areas: next };
+    });
+    setStatusMsg(`Area "${id}" deleted.`);
+  }
+
+  function renameArea(oldId: string, newId: string) {
+    if (!newId.trim() || newId === oldId) return;
+    if (config.areas[newId.trim()]) {
+      setStatusMsg(`Area "${newId}" already exists.`);
+      return;
+    }
+    setConfig((c) => {
+      const next = { ...c.areas };
+      const area = next[oldId];
+      if (!area) return c;
+      delete next[oldId];
+      next[newId.trim()] = { ...area, id: newId.trim() };
+      return { ...c, areas: next };
+    });
+    setStatusMsg(`Area renamed to "${newId.trim()}".`);
+  }
+
+  function goToArea(areaId: string) {
+    const area = config.areas[areaId];
+    if (!area?.cameraPosition) return;
+    setStatusMsg(`Going to area "${areaId}"…`);
+    startNavigation(
+      area.cameraPosition,
+      area.cameraLookAt ?? null,
+      () => {
+        setConfig((c) => ({ ...c, homePosition: area.cameraPosition, homeLookAt: area.cameraLookAt ?? c.homeLookAt }));
+        setStatusMsg(`Arrived at area "${areaId}". Home set to this area.`);
+      },
+    );
+  }
+
   // ---------- Path node management ----------
   function addPathNodeAtCamera() {
     const cam = cameraRef.current;
@@ -1759,7 +1822,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/auth/change-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-admin-token": adminToken },
-        body: JSON.stringify({ newPassword: newPasswordInput }),
+        body: JSON.stringify({ token: adminToken, newPassword: newPasswordInput }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -1856,6 +1919,10 @@ export default function App() {
         changed: JSON.stringify(snap.shelves) !== JSON.stringify(config.shelves),
         summary: `${Object.keys(config.shelves).length} shelf/shelves`,
       },
+      "Areas": {
+        changed: JSON.stringify(snap.areas) !== JSON.stringify(config.areas),
+        summary: `${Object.keys(config.areas).length} area(s)`,
+      },
     };
   }
 
@@ -1865,7 +1932,7 @@ export default function App() {
       .then((data) => {
         setLoadModalData({ ...defaultConfig, ...data } as Config);
         setLoadModalName(name);
-        setLoadModalChecks({ model: true, objects: true, home: true, pathNodes: true, cameraSpeed: true, shelves: true });
+        setLoadModalChecks({ model: true, objects: true, home: true, pathNodes: true, cameraSpeed: true, shelves: true, areas: true });
         setShowLoadModal(true);
       })
       .catch((e) => setStatusMsg(`Load failed: ${e.message}`));
@@ -1897,6 +1964,7 @@ export default function App() {
       if (loadModalChecks.pathNodes) merged.pathNodes = { ...loadModalData.pathNodes };
       if (loadModalChecks.cameraSpeed) merged.cameraSpeed = loadModalData.cameraSpeed;
       if (loadModalChecks.shelves) merged.shelves = { ...loadModalData.shelves };
+      if (loadModalChecks.areas) merged.areas = { ...loadModalData.areas };
       setPartialMergeResult(merged);
       setShowPartialNamePrompt(true);
       setShowLoadModal(false);
@@ -2681,8 +2749,12 @@ export default function App() {
               changePassword={changePassword}
               passwordError={passwordError}
                setPasswordError={setPasswordError}
-               setCameraFov={setCameraFov}
-             />
+                setCameraFov={setCameraFov}
+                createArea={createArea}
+                deleteArea={deleteArea}
+                renameArea={renameArea}
+                goToArea={goToArea}
+              />
           )}
 
           {panel === "runtime" && (
@@ -2691,6 +2763,8 @@ export default function App() {
               setQuery={setRuntimeQuery}
               run={runRuntime}
               shelves={Object.values(config.shelves)}
+              areas={Object.values(config.areas)}
+              goToArea={goToArea}
               returnHome={returnHome}
               mode={mode}
             />
@@ -2904,7 +2978,7 @@ export default function App() {
               Uncheck any settings to keep current values:
             </div>
             <div className="col" style={{ gap: 2, fontSize: 12 }}>
-              {[{ key: "model", label: "Warehouse Model" }, { key: "objects", label: "Scene Objects" }, { key: "home", label: "Home Position" }, { key: "pathNodes", label: "Path Nodes" }, { key: "cameraSpeed", label: "Camera Speed" }, { key: "shelves", label: "Shelves" }].map(({ key, label }) => (
+              {[{ key: "model", label: "Warehouse Model" }, { key: "objects", label: "Scene Objects" }, { key: "home", label: "Home Position" }, { key: "pathNodes", label: "Path Nodes" }, { key: "cameraSpeed", label: "Camera Speed" }, { key: "shelves", label: "Shelves" }, { key: "areas", label: "Areas" }].map(({ key, label }) => (
                 <label key={key} className="row" style={{ cursor: "pointer", gap: 8, padding: "4px 0" }}>
                   <input type="checkbox" checked={loadModalChecks[key] ?? true} onChange={(e) => setLoadModalChecks((p) => ({ ...p, [key]: e.target.checked }))} />
                   {label}
@@ -3068,6 +3142,10 @@ function AdminPanel(props: {
   passwordError: string;
   setPasswordError: (v: string) => void;
   setCameraFov: (v: number) => void;
+  createArea: () => void;
+  deleteArea: (id: string) => void;
+  renameArea: (oldId: string, newId: string) => void;
+  goToArea: (id: string) => void;
 }) {
   const {
     config,
@@ -3134,6 +3212,10 @@ function AdminPanel(props: {
     passwordError,
     setPasswordError,
     setCameraFov,
+    createArea,
+    deleteArea,
+    renameArea,
+    goToArea,
   } = props;
   const [renameShelfId, setRenameShelfId] = useState("");
   const [renameShelfBarcode, setRenameShelfBarcode] = useState("");
@@ -3388,6 +3470,42 @@ function AdminPanel(props: {
                   style={{ fontSize: 10, padding: "2px 5px" }}
                   className="danger"
                   onClick={() => deletePathNode(n.id)}
+                >✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="divider" />
+
+      <h4>Areas</h4>
+      <div className="col">
+        <button className="primary" onClick={createArea}>
+          Capture Current Position as Area
+        </button>
+        {Object.values(config.areas).length > 0 && (
+          <div className="col" style={{ gap: 4, marginTop: 4 }}>
+            {Object.values(config.areas).map((a) => (
+              <div key={a.id} className="row" style={{ gap: 4, alignItems: "center" }}>
+                <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {a.id}
+                </span>
+                <button
+                  style={{ fontSize: 10, padding: "2px 5px" }}
+                  onClick={() => {
+                    const name = prompt("New area name:", a.id);
+                    if (name) renameArea(a.id, name);
+                  }}
+                >✎</button>
+                <button
+                  style={{ fontSize: 10, padding: "2px 5px" }}
+                  onClick={() => goToArea(a.id)}
+                >▶</button>
+                <button
+                  style={{ fontSize: 10, padding: "2px 5px" }}
+                  className="danger"
+                  onClick={() => deleteArea(a.id)}
                 >✕</button>
               </div>
             ))}
@@ -3823,10 +3941,12 @@ function RuntimePanel(props: {
   setQuery: (s: string) => void;
   run: (q: string) => void;
   shelves: Shelf[];
+  areas: Area[];
+  goToArea: (id: string) => void;
   returnHome: () => void;
   mode: AppMode;
 }) {
-  const { query, setQuery, run, shelves, returnHome, mode } = props;
+  const { query, setQuery, run, shelves, areas, goToArea, returnHome, mode } = props;
   return (
     <div className="col">
       <h4>Find Shelf</h4>
@@ -3849,21 +3969,21 @@ function RuntimePanel(props: {
         </button>
       </form>
       <div className="muted">
-        {shelves.length} shelves available
+        {shelves.length} shelves · {areas.length} areas
       </div>
 
-      {shelves.length > 0 && (
+      {areas.length > 0 && (
         <>
-          <h4>Quick Pick</h4>
+          <h4>Areas</h4>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-            {shelves.map((s) => (
+            {areas.map((a) => (
               <button
-                key={s.id}
-                onClick={() => { run(s.id); setQuery(""); }}
-                disabled={mode === "navigating" || !s.cameraPosition}
-                title={!s.cameraPosition ? "No pose saved" : `Go to ${s.id}`}
+                key={a.id}
+                onClick={() => { goToArea(a.id); setQuery(""); }}
+                disabled={mode === "navigating"}
+                title={`Go to ${a.id}`}
               >
-                {s.id}
+                {a.id}
               </button>
             ))}
           </div>

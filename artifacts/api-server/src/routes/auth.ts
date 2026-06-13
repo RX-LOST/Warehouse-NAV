@@ -37,7 +37,7 @@ router.post("/auth/change-password", requireToken, async (req, res) => {
     res.status(400).json({ error: "Bad Request", message: "New password must be at least 4 characters" });
     return;
   }
-  const token = req.headers["x-admin-token"] as string;
+  const token = req.headers["x-admin-token"] as string ?? req.body?.token ?? "";
   const ok = await changePassword(token, newPassword);
   if (!ok) {
     res.status(500).json({ error: "Internal Server Error", message: "Failed to change password" });
