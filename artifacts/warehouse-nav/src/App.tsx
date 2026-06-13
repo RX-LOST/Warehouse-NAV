@@ -1758,8 +1758,8 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/auth/change-password`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: adminToken, newPassword: newPasswordInput }),
+        headers: { "Content-Type": "application/json", "x-admin-token": adminToken },
+        body: JSON.stringify({ newPassword: newPasswordInput }),
       });
       const data = await res.json();
       if (!res.ok) {
