@@ -544,10 +544,10 @@ export default function App() {
       .then((r) => r.json())
       .then((data) => {
         if (cancelled || !data?.name) return;
-        const loaded = { ...defaultConfig, ...data } as Config;
-        setConfig(loaded);
+        const serverConfig = { ...defaultConfig, ...data } as Config;
+        setConfig((prev) => ({ ...serverConfig, ...prev }));
         setLoadedConfigName(data.name);
-        setLoadedConfigHash(JSON.stringify(loaded));
+        setLoadedConfigHash(JSON.stringify(serverConfig));
       })
       .catch(() => {});
     return () => { cancelled = true; };
