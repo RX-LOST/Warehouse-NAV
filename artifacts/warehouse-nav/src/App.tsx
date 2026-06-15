@@ -545,17 +545,7 @@ export default function App() {
       .then((data) => {
         if (cancelled || !data?.name) return;
         const serverConfig = { ...defaultConfig, ...data } as Config;
-        setConfig((prev) => {
-          const merged = { ...serverConfig };
-          for (const key of Object.keys(prev)) {
-            if (JSON.stringify(prev[key]) !== JSON.stringify(defaultConfig[key])) {
-              merged[key] = prev[key];
-            }
-          }
-          merged.areas = { ...serverConfig.areas, ...prev.areas };
-          merged.shelves = { ...serverConfig.shelves, ...prev.shelves };
-          return merged;
-        });
+        setConfig((prev) => ({ ...serverConfig, ...prev }));
         setLoadedConfigName(data.name);
         setLoadedConfigHash(JSON.stringify(serverConfig));
       })
