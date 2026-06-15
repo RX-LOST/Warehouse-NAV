@@ -11,8 +11,6 @@ export const IS_PRODUCTION = NODE_ENV === "production";
 export const LOG_LEVEL = process.env["LOG_LEVEL"] ?? (IS_PRODUCTION ? "info" : "debug");
 
 export const DATA_DIR = path.resolve(APP_ROOT, "data");
-export const GLB_DIR = path.join(DATA_DIR, "glbs");
-export const PHOTO_DIR = path.join(DATA_DIR, "photos");
 export const CONFIG_DIR = path.join(DATA_DIR, "configs");
 export const AUTH_DIR = path.join(DATA_DIR, "auth");
 export const STAGING_DIR = path.join(DATA_DIR, "staging");

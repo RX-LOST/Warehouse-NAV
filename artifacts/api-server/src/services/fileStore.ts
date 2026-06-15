@@ -1,10 +1,62 @@
 import fs from "node:fs";
 import path from "node:path";
 import multer from "multer";
-import { GLB_DIR, PHOTO_DIR, CONFIG_DIR, STAGING_DIR, MAX_FILE_SIZE } from "../config.js";
+import { DATA_DIR, CONFIG_DIR, STAGING_DIR, MAX_FILE_SIZE } from "../config.js";
 
 // Ensure all base directories exist
-[GLB_DIR, PHOTO_DIR, CONFIG_DIR, STAGING_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
+[CONFIG_DIR, STAGING_DIR].forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
+
+// ---------------------------------------------------------------------------
+// Migration from old flat-file format (configs/<name>.json) to new directory
+// format (configs/<name>/config.json). Also migrates old file URLs and GLB
+// locations. Runs once on module load.
+// ---------------------------------------------------------------------------
+function migrateOldConfigs(): void {
+  let entries: string[];
+  try { entries = fs.readdirSync(CONFIG_DIR); } catch { return; }
+
+  for (const entry of entries) {
+    if (entry === "_active" || entry === ".gitkeep") continue;
+
+    const fullPath = path.join(CONFIG_DIR, entry);
+    if (fs.statSync(fullPath).isDirectory()) continue;
+
+    const name = entry.replace(/\.json$/i, "");
+    if (!name) continue;
+
+    try {
+      const raw = fs.readFileSync(fullPath, "utf8");
+      const data = JSON.parse(raw) as Record<string, unknown>;
+
+      const OLD_GLBS_DIR = path.join(DATA_DIR, "glbs");
+      const oldGlbUrl = data.glbUrl as string | undefined;
+      if (oldGlbUrl && oldGlbUrl.startsWith("/api/files/glbs/")) {
+        const filename = oldGlbUrl.slice("/api/files/glbs/".length);
+        const oldFile = path.join(OLD_GLBS_DIR, filename);
+        if (fs.existsSync(oldFile)) {
+          const configDir = ensureConfigDir(name);
+          fs.mkdirSync(path.join(configDir, "glb"), { recursive: true });
+          fs.copyFileSync(oldFile, path.join(configDir, "glb", "scene.glb"));
+          data.glbUrl = `/api/configs/files/${name}/glb/scene.glb`;
+        }
+      }
+
+      saveConfigJson(name, data);
+      fs.unlinkSync(fullPath);
+    } catch {
+      // skip corrupt entries
+    }
+  }
+
+  if (!getActiveConfigName()) {
+    const names = listConfigNames();
+    if (names.length > 0) {
+      setActiveConfigName(names[0]!);
+    }
+  }
+}
+
+migrateOldConfigs();
 
 function sanitizeFilename(name: string): string {
   return path.basename(name).replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -160,11 +212,4 @@ export function getConfigFilePath(configName: string, subdir: string, filename: 
   return p;
 }
 
-// ---------------------------------------------------------------------------
-// Legacy helpers (kept for compatibility; used by health route)
-// ---------------------------------------------------------------------------
-export function legacyListFiles(subpath: "glbs" | "photos" | "configs"): string[] {
-  const dir = subpath === "glbs" ? GLB_DIR : subpath === "photos" ? PHOTO_DIR : CONFIG_DIR;
-  try { return fs.readdirSync(dir); }
-  catch { return []; }
-}
+
