@@ -549,7 +549,7 @@ export default function App() {
           const merged = { ...serverConfig };
           for (const key of Object.keys(prev) as (keyof Config)[]) {
             if (JSON.stringify(prev[key]) !== JSON.stringify(defaultConfig[key])) {
-              merged[key] = prev[key];
+              (merged as Record<string, unknown>)[key] = (prev as Record<string, unknown>)[key];
             }
           }
           merged.areas = { ...serverConfig.areas, ...prev.areas };
